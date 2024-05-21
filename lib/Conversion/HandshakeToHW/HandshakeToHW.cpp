@@ -162,6 +162,20 @@ static std::string getTypeName(Location loc, Type type) {
   return typeName;
 }
 
+static int32_t getTypeWidth(Type type) {
+  int32_t width = 0;
+  // Builtin types
+  if (type.isIntOrIndex()) {
+    if (auto indexType = dyn_cast<IndexType>(type))
+      width = indexType.kInternalStorageBitWidth;
+    else if (type.isSignedInteger())
+      width = type.getIntOrFloatBitWidth();
+    else
+      width = type.getIntOrFloatBitWidth();
+  };
+  return width;
+}
+
 /// Construct a name for creating HW sub-module.
 static std::string getSubModuleName(Operation *oldOp) {
   if (auto instanceOp = dyn_cast<handshake::InstanceOp>(oldOp); instanceOp)
@@ -170,19 +184,19 @@ static std::string getSubModuleName(Operation *oldOp) {
   std::string subModuleName = getBareSubModuleName(oldOp);
 
   // Add value of the constant operation.
-  if (auto constOp = dyn_cast<handshake::ConstantOp>(oldOp)) {
-    if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
-      auto intType = intAttr.getType();
+  // if (auto constOp = dyn_cast<handshake::ConstantOp>(oldOp)) {
+  //   if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+  //     auto intType = intAttr.getType();
 
-      if (intType.isSignedInteger())
-        subModuleName += "_c" + std::to_string(intAttr.getSInt());
-      else if (intType.isUnsignedInteger())
-        subModuleName += "_c" + std::to_string(intAttr.getUInt());
-      else
-        subModuleName += "_c" + std::to_string((uint64_t)intAttr.getInt());
-    } else
-      oldOp->emitError("unsupported constant type");
-  }
+  //     if (intType.isSignedInteger())
+  //       subModuleName += "_c" + std::to_string(intAttr.getSInt());
+  //     else if (intType.isUnsignedInteger())
+  //       subModuleName += "_c" + std::to_string(intAttr.getUInt());
+  //     else
+  //       subModuleName += "_c" + std::to_string((uint64_t)intAttr.getInt());
+  //   } else
+  //     oldOp->emitError("unsupported constant type");
+  // }
 
   // Add discriminating in- and output types.
   auto [inTypes, outTypes] = getHandshakeDiscriminatingTypes(oldOp);
@@ -196,31 +210,31 @@ static std::string getSubModuleName(Operation *oldOp) {
   for (auto outType : outTypes)
     subModuleName += getTypeName(oldOp->getLoc(), outType);
 
-  // Add memory ID.
-  if (auto memOp = dyn_cast<handshake::MemoryOp>(oldOp))
-    subModuleName += "_id" + std::to_string(memOp.getId());
+  // // Add memory ID.
+  // if (auto memOp = dyn_cast<handshake::MemoryOp>(oldOp))
+  //   subModuleName += "_id" + std::to_string(memOp.getId());
 
-  // Add compare kind.
-  if (auto comOp = dyn_cast<mlir::arith::CmpIOp>(oldOp))
-    subModuleName += "_" + stringifyEnum(comOp.getPredicate()).str();
+  // // Add compare kind.
+  // if (auto comOp = dyn_cast<mlir::arith::CmpIOp>(oldOp))
+  //   subModuleName += "_" + stringifyEnum(comOp.getPredicate()).str();
 
-  // Add buffer information.
-  if (auto bufferOp = dyn_cast<handshake::BufferOp>(oldOp)) {
-    subModuleName += "_" + std::to_string(bufferOp.getNumSlots()) + "slots";
-    if (bufferOp.isSequential())
-      subModuleName += "_seq";
-    else
-      subModuleName += "_fifo";
+  // // Add buffer information.
+  // if (auto bufferOp = dyn_cast<handshake::BufferOp>(oldOp)) {
+  //   subModuleName += "_" + std::to_string(bufferOp.getNumSlots()) +
+  //   "slots"; if (bufferOp.isSequential())
+  //     subModuleName += "_seq";
+  //   else
+  //     subModuleName += "_fifo";
 
-    if (auto initValues = bufferOp.getInitValues()) {
-      subModuleName += "_init";
-      for (const Attribute e : *initValues) {
-        assert(isa<IntegerAttr>(e));
-        subModuleName +=
-            "_" + std::to_string(dyn_cast<IntegerAttr>(e).getInt());
-      }
-    }
-  }
+  //   if (auto initValues = bufferOp.getInitValues()) {
+  //     subModuleName += "_init";
+  //     for (const Attribute e : *initValues) {
+  //       assert(isa<IntegerAttr>(e));
+  //       subModuleName +=
+  //           "_" + std::to_string(dyn_cast<IntegerAttr>(e).getInt());
+  //     }
+  //   }
+  // }
 
   // Add control information.
   if (auto ctrlInterface = dyn_cast<handshake::ControlInterface>(oldOp);
@@ -247,8 +261,9 @@ static std::string getSubModuleName(Operation *oldOp) {
 /// return nullptr.
 static HWModuleLike checkSubModuleOp(mlir::ModuleOp parentModule,
                                      StringRef modName) {
-  if (auto mod = parentModule.lookupSymbol<HWModuleOp>(modName))
+  if (auto mod = parentModule.lookupSymbol<HWModuleOp>(modName)) {
     return mod;
+  }
   if (auto mod = parentModule.lookupSymbol<HWModuleExternOp>(modName))
     return mod;
   return {};
@@ -500,13 +515,14 @@ public:
     // instantiate the submodule. Else, run the pattern-defined module
     // builder.
     hw::HWModuleLike implModule = checkSubModuleOp(ls.parentModule, op);
+    ArrayAttr paramsAttr = getModuleParams(op);
     if (!implModule) {
       auto portInfo = ModulePortInfo(getPortInfoForOp(op));
-
       submoduleBuilder.setInsertionPoint(op->getParentOp());
       implModule = submoduleBuilder.create<hw::HWModuleOp>(
           op.getLoc(), submoduleBuilder.getStringAttr(getSubModuleName(op)),
-          portInfo, [&](OpBuilder &b, hw::HWModulePortAccessor &ports) {
+          portInfo,
+          [&](OpBuilder &b, hw::HWModulePortAccessor &ports) {
             // if 'op' has clock trait, extract these and provide them to the
             // RTL builder.
             Value clk, rst;
@@ -518,14 +534,68 @@ public:
             BackedgeBuilder bb(b, op.getLoc());
             RTLBuilder s(ports.getPortList(), b, op.getLoc(), clk, rst);
             this->buildModule(op, bb, s, ports);
-          });
+          },
+          paramsAttr);
     }
     // Instantiate the submodule.
     llvm::SmallVector<Value> operands = adaptor.getOperands();
     addSequentialIOOperandsIfNeeded(op, operands);
     rewriter.replaceOpWithNewOp<hw::InstanceOp>(
-        op, implModule, rewriter.getStringAttr(ls.nameUniquer(op)), operands);
+        op, implModule, rewriter.getStringAttr(ls.nameUniquer(op)), operands,
+        paramsAttr);
     return success();
+  }
+
+  ArrayAttr getModuleParams(Operation *op) const {
+    if (auto instanceOp = dyn_cast<handshake::InstanceOp>(op); instanceOp)
+      return instanceOp.getModuleAttr().cast<ArrayAttr>();
+    SmallVector<Attribute, 4> params;
+    if (handshake::ConstantOp constOp = dyn_cast<handshake::ConstantOp>(op)) {
+      if (IntegerAttr intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+        auto param = hw::ParamDeclAttr::get(
+            "WIDTH", submoduleBuilder.getIntegerAttr(
+                         submoduleBuilder.getI32Type(),
+                         static_cast<int64_t>(log2(intAttr.getInt()))));
+        params.push_back(param);
+      }
+    }
+
+    // Add in out param.
+    auto [inTypes, outTypes] = getHandshakeDiscriminatingTypes(op);
+
+    for (auto [i, inType] : llvm::enumerate(inTypes)) {
+      if (auto tupleType = dyn_cast<TupleType>(inType))
+        continue;
+      if (auto structType = dyn_cast<hw::StructType>(inType))
+        continue;
+      auto param = hw::ParamDeclAttr::get(
+          "IN_WIDTH_" + std::to_string(i),
+          submoduleBuilder.getIntegerAttr(submoduleBuilder.getI32Type(),
+                                          getTypeWidth(inType)));
+      params.push_back(param);
+    }
+
+    for (auto [i, outType] : llvm::enumerate(outTypes)) {
+      if (auto tupleType = dyn_cast<TupleType>(outType))
+        continue;
+      if (auto structType = dyn_cast<hw::StructType>(outType))
+        continue;
+      auto param = hw::ParamDeclAttr::get(
+          "OUT_WIDTH_" + std::to_string(i),
+          submoduleBuilder.getIntegerAttr(submoduleBuilder.getI32Type(),
+                                          getTypeWidth(outType)));
+      params.push_back(param);
+    }
+
+    // Add buffer information.
+    if (auto bufferOp = dyn_cast<handshake::BufferOp>(op)) {
+      auto param = hw::ParamDeclAttr::get(
+          "SLOTS", submoduleBuilder.getIntegerAttr(
+                       submoduleBuilder.getI32Type(), bufferOp.getNumSlots()));
+      params.push_back(param);
+    }
+
+    return submoduleBuilder.getArrayAttr(params);
   }
 
   virtual void buildModule(T op, BackedgeBuilder &bb, RTLBuilder &builder,
@@ -590,7 +660,8 @@ public:
   // the 'unwrapped' inputs and provide it as a separate argument.
   void buildMuxLogic(RTLBuilder &s, UnwrappedIO &unwrapped,
                      InputHandshake &select) const {
-    // ============================= Control logic =============================
+    // ============================= Control logic
+    // =============================
     size_t numInputs = unwrapped.inputs.size();
     size_t selectWidth = llvm::Log2_64_Ceil(numInputs);
     Value truncatedSelect =
@@ -626,7 +697,8 @@ public:
       in.ready->setValue(activeAndResultValidAndReady);
     }
 
-    // ============================== Data logic ===============================
+    // ============================== Data logic
+    // ===============================
     res.data->setValue(s.mux(truncatedSelect, unwrapped.getInputDatas()));
   }
 
@@ -1118,20 +1190,20 @@ public:
     // Create predicates to assert if the win wire holds a valid index.
     auto hasWinnerCondition = s.rOr(win);
 
-    // Create an arbiter based on a simple priority-encoding scheme to assign an
-    // index to the win wire. In the case that no input is valid, set a sentinel
-    // value to indicate no winner was chosen. The constant values are
-    // remembered in a map so they can be re-used later to assign the arg ready
-    // outputs.
+    // Create an arbiter based on a simple priority-encoding scheme to assign
+    // an index to the win wire. In the case that no input is valid, set a
+    // sentinel value to indicate no winner was chosen. The constant values
+    // are remembered in a map so they can be re-used later to assign the arg
+    // ready outputs.
     DenseMap<size_t, Value> argIndexValues;
     Value priorityArb = buildPriorityArbiter(s, unwrappedIO.getInputValids(),
                                              noWinner, argIndexValues);
     win.setValue(priorityArb);
 
-    // Create the logic to assign the result outputs. The result valid and data
-    // outputs will always be assigned. The win wire from the arbiter is used to
-    // index into a tree of muxes to select the chosen input's signal(s). The
-    // result outputs are gated on the win wire being non-zero.
+    // Create the logic to assign the result outputs. The result valid and
+    // data outputs will always be assigned. The win wire from the arbiter is
+    // used to index into a tree of muxes to select the chosen input's
+    // signal(s). The result outputs are gated on the win wire being non-zero.
 
     resData.valid->setValue(hasWinnerCondition);
     resData.data->setValue(s.ohMux(win, unwrappedIO.getInputDatas()));
@@ -1284,13 +1356,13 @@ public:
       st.done.valid->setValue(writeValidBuffer);
       st.done.data->setValue(c0I0);
 
-      // Create the logic for when both the buffered write valid signal and the
-      // store complete ready signal are asserted.
+      // Create the logic for when both the buffered write valid signal and
+      // the store complete ready signal are asserted.
       auto storeCompleted =
           s.bAnd({st.done.ready, writeValidBuffer}, "storeCompleted");
 
-      // Create a signal for when the write valid buffer is empty or the output
-      // is ready.
+      // Create a signal for when the write valid buffer is empty or the
+      // output is ready.
       auto notWriteValidBuffer = s.bNot(writeValidBuffer);
       auto emptyOrComplete =
           s.bOr({notWriteValidBuffer, storeCompleted}, "emptyOrComplete");
@@ -1309,8 +1381,8 @@ public:
       writeValidBufferMuxBE.setValue(
           s.mux(emptyOrComplete, {writeValidBuffer, writeValid}));
 
-      // Instantiate the write port operation - truncate address width to memory
-      // width.
+      // Instantiate the write port operation - truncate address width to
+      // memory width.
       llvm::SmallVector<Value> addresses = {s.truncate(st.addr.data, cl2dim)};
       s.b.create<seq::WritePortOp>(loc, hlmem.getHandle(), addresses,
                                    st.data.data, writeValid,
@@ -1541,18 +1613,72 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
 
     hw::HWModuleLike implModule = checkSubModuleOp(ls.parentModule, op);
+    ArrayAttr params = getModuleParams(op);
     if (!implModule) {
       auto portInfo = ModulePortInfo(getPortInfoForOp(op));
       implModule = submoduleBuilder.create<hw::HWModuleExternOp>(
           op.getLoc(), submoduleBuilder.getStringAttr(getSubModuleName(op)),
-          portInfo);
+          portInfo, params);
     }
 
     llvm::SmallVector<Value> operands = adaptor.getOperands();
     addSequentialIOOperandsIfNeeded(op, operands);
     rewriter.replaceOpWithNewOp<hw::InstanceOp>(
-        op, implModule, rewriter.getStringAttr(ls.nameUniquer(op)), operands);
+        op, implModule, rewriter.getStringAttr(ls.nameUniquer(op)), operands,
+        params);
     return success();
+  }
+
+  ArrayAttr getModuleParams(Operation *op) const {
+    if (auto instanceOp = dyn_cast<handshake::InstanceOp>(op); instanceOp)
+      return instanceOp.getModuleAttr().cast<ArrayAttr>();
+    SmallVector<Attribute, 4> params;
+    if (handshake::ConstantOp constOp = dyn_cast<handshake::ConstantOp>(op)) {
+      if (IntegerAttr intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+        auto param = hw::ParamDeclAttr::get(
+            "WIDTH", submoduleBuilder.getIntegerAttr(
+                         submoduleBuilder.getI32Type(),
+                         static_cast<int64_t>(log2(intAttr.getInt()))));
+        params.push_back(param);
+      }
+    }
+
+    // Add in out param.
+    auto [inTypes, outTypes] = getHandshakeDiscriminatingTypes(op);
+
+    for (auto [i, inType] : llvm::enumerate(inTypes)) {
+      if (auto tupleType = dyn_cast<TupleType>(inType))
+        continue;
+      if (auto structType = dyn_cast<hw::StructType>(inType))
+        continue;
+      auto param = hw::ParamDeclAttr::get(
+          "IN_WIDTH_" + std::to_string(i),
+          submoduleBuilder.getIntegerAttr(submoduleBuilder.getI32Type(),
+                                          getTypeWidth(inType)));
+      params.push_back(param);
+    }
+
+    for (auto [i, outType] : llvm::enumerate(outTypes)) {
+      if (auto tupleType = dyn_cast<TupleType>(outType))
+        continue;
+      if (auto structType = dyn_cast<hw::StructType>(outType))
+        continue;
+      auto param = hw::ParamDeclAttr::get(
+          "OUT_WIDTH_" + std::to_string(i),
+          submoduleBuilder.getIntegerAttr(submoduleBuilder.getI32Type(),
+                                          getTypeWidth(outType)));
+      params.push_back(param);
+    }
+
+    // Add buffer information.
+    if (auto bufferOp = dyn_cast<handshake::BufferOp>(op)) {
+      auto param = hw::ParamDeclAttr::get(
+          "SLOTS", submoduleBuilder.getIntegerAttr(
+                       submoduleBuilder.getI32Type(), bufferOp.getNumSlots()));
+      params.push_back(param);
+    }
+
+    return submoduleBuilder.getArrayAttr(params);
   }
 
 private:

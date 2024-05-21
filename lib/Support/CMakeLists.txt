@@ -22,6 +22,7 @@ add_circt_library(CIRCTSupport
   SymCache.cpp
   ValueMapper.cpp
   InstanceGraph.cpp
+  RTLBuilder.cpp
   "${VERSION_CPP}"
 
   LINK_LIBS PUBLIC
