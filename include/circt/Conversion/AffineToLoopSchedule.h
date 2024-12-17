@@ -10,7 +10,10 @@
 #ifndef CIRCT_CONVERSION_AFFINETOLOOPSCHEDULE_H_
 #define CIRCT_CONVERSION_AFFINETOLOOPSCHEDULE_H_
 
+#include "circt/Support/LLVM.h"
 #include <memory>
+#include <optional>
+#include <string>
 
 namespace mlir {
 class Pass;
@@ -21,7 +24,7 @@ namespace circt {
 #define GEN_PASS_DECL_AFFINETOLOOPSCHEDULE
 #include "circt/Conversion/Passes.h.inc"
 
-std::unique_ptr<mlir::Pass> createAffineToLoopSchedule();
+
 } // namespace circt
 
 #endif // CIRCT_CONVERSION_AFFINETOLOOPSCHEDULE_H_

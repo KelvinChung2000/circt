@@ -1058,6 +1058,9 @@ class BuildPipelineGroups : public calyx::FuncOpPartialLoweringPattern {
       // Get the pipeline register for that result.
       auto pipelineRegister = pipelineRegisters[i];
 
+      llvm::outs() << "Pipeline register: " << pipelineRegister << "\n";
+      llvm::outs() << "Value: " << value << "\n";
+
       // Get the evaluating group for that value.
       calyx::GroupInterface evaluatingGroup =
           getState<ComponentLoweringState>().getEvaluatingGroup(value);

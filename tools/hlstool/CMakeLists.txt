@@ -37,6 +37,7 @@ target_link_libraries(hlstool
   CIRCTFSMTransforms
   CIRCTFSMToSV
   CIRCTTransforms
+  CIRCTHlsToolLib
 
   MLIRIR
   MLIRLLVMDialect

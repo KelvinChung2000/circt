@@ -56,8 +56,9 @@ using namespace circt::loopschedule;
 
 namespace {
 
-struct AffineToLoopSchedule
+class AffineToLoopSchedule
     : public circt::impl::AffineToLoopScheduleBase<AffineToLoopSchedule> {
+  using Base::Base;
   void runOnOperation() override;
 
 private:
@@ -107,6 +108,7 @@ ModuloProblem AffineToLoopSchedule::getModuloProblem(CyclicProblem &prob) {
 }
 
 void AffineToLoopSchedule::runOnOperation() {
+
   // Get dependence analysis for the whole function.
   auto dependenceAnalysis = getAnalysis<MemoryDependenceAnalysis>();
 
@@ -123,9 +125,12 @@ void AffineToLoopSchedule::runOnOperation() {
     SmallVector<AffineForOp> nestedLoops;
     getPerfectlyNestedLoops(nestedLoops, root);
 
-    // Restrict to single loops to simplify things for now.
-    if (nestedLoops.size() != 1)
-      continue;
+    LLVM_DEBUG(llvm::dbgs() << "Perfectly nested loops count: "
+                            << nestedLoops.size() << "\n";);
+
+    // // Restrict to single loops to simplify things for now.
+    // if (nestedLoops.size() != 1)
+    //   continue;
 
     ModuloProblem moduloProblem =
         getModuloProblem(schedulingAnalysis->getProblem(nestedLoops.back()));
@@ -409,9 +414,13 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   // Scheduling analyis only considers the innermost loop nest for now.
   auto forOp = loopNest.back();
 
+  LLVM_DEBUG(llvm::dbgs() << "Creating pipeline for op:\n";
+             forOp->print(llvm::outs(), OpPrintingFlags().printGenericOpForm());
+             llvm::dbgs() << "\n\n";);
+
   auto outerLoop = loopNest.front();
   auto innerLoop = loopNest.back();
-  ImplicitLocOpBuilder builder(outerLoop.getLoc(), outerLoop);
+  ImplicitLocOpBuilder builder(innerLoop.getLoc(), innerLoop);
 
   // Create Values for the loop's lower and upper bounds.
   Value lowerBound = lowerAffineLowerBound(innerLoop, builder);
@@ -462,9 +471,10 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   IRMapping valueMap;
   // Nested loops are not supported yet.
   assert(iterArgs.size() == forOp.getBody()->getNumArguments());
-  for (size_t i = 0; i < iterArgs.size(); ++i)
+  for (size_t i = 0; i < iterArgs.size(); ++i) {
     valueMap.map(forOp.getBody()->getArgument(i),
                  pipeline.getStagesBlock().getArgument(i));
+  }
 
   // Create the stages.
   Block &stagesBlock = pipeline.getStagesBlock();
@@ -524,19 +534,28 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
         registerValues.push_back(SmallVector<Value>());
 
       // Keep a collection of this stages results as keys to our valueMaps
-      for (auto result : op->getResults())
+      for (auto result : op->getResults()) {
         registerValues[startTime].push_back(result);
+      }
 
       // Other stages that use the value will need these values as keys too
       unsigned firstUse = std::max(
           startTime + 1,
           startTime + *problem.getLatency(*problem.getLinkedOperatorType(op)));
       for (unsigned i = firstUse; i < pipeEndTime; ++i) {
-        for (auto result : op->getResults())
+        for (auto result : op->getResults()) {
           registerValues[i].push_back(result);
+        }
       }
     }
   }
+
+  LLVM_DEBUG(llvm::dbgs() << "Register Values:\n";
+             for (unsigned i = 0; i < registerValues.size(); ++i) {
+               llvm::dbgs() << "Time: " << i << "\n";
+               for (auto val : registerValues[i])
+                 llvm::dbgs() << "  " << val << "\n";
+             });
 
   // Now make register Types and stageValueMaps
   for (unsigned i = 0; i < registerValues.size(); ++i) {
@@ -550,6 +569,11 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
 
   // One more map is needed for the pipeline stages terminator
   stageValueMaps.push_back(valueMap);
+
+  std::vector<std::pair<unsigned, unsigned>> timePairs;
+  for (size_t i = 0; i < startTimes.size() - 1; i++) {
+    timePairs.push_back({startTimes[i], startTimes[i + 1]});
+  }
 
   // Create stages along with maps
   for (auto startTime : startTimes) {
@@ -585,6 +609,8 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
     SmallVector<Value> stageOperands;
     unsigned resIndex = 0;
     for (auto res : registerValues[startTime]) {
+      LLVM_DEBUG(llvm::outs()
+                 << "StartTime:" << startTime << " res: " << res << "\n");
       stageOperands.push_back(stageValueMaps[startTime].lookup(res));
       // Additionally, update the map of the stage that will consume the
       // registered value
@@ -595,9 +621,18 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
       if (*problem.getStartTime(res.getDefiningOp()) == startTime &&
           latency > 1)
         destTime = startTime + latency;
-      destTime = std::min((unsigned)(stageValueMaps.size() - 1), destTime);
-      stageValueMaps[destTime].map(res, stage.getResult(resIndex++));
+
+      for (auto user : res.getUsers()) {
+        destTime = *problem.getStartTime(user);
+        for (unsigned i = startTime + latency; i <= destTime; ++i) {
+          stageValueMaps[i].map(res, stage.getResult(resIndex));
+          LLVM_DEBUG(llvm::outs() << "Map at time " << i << " " << res << "\n");
+        }
+      }
+      resIndex++;
+      LLVM_DEBUG(llvm::outs() << "\n");
     }
+
     // Add these mapped values to pipeline.register
     stageTerminator->insertOperands(stageTerminator->getNumOperands(),
                                     stageOperands);
@@ -638,7 +673,7 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
     forOp.getResult(i).replaceAllUsesWith(pipeline.getResult(i));
 
   // Remove the loop nest from the IR.
-  loopNest.front().walk([](Operation *op) {
+  loopNest.back().walk([](Operation *op) {
     op->dropAllUses();
     op->dropAllDefinedValueUses();
     op->dropAllReferences();
@@ -646,8 +681,4 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   });
 
   return success();
-}
-
-std::unique_ptr<mlir::Pass> circt::createAffineToLoopSchedule() {
-  return std::make_unique<AffineToLoopSchedule>();
 }

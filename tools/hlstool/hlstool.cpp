@@ -56,11 +56,14 @@
 #include "circt/Support/LoweringOptions.h"
 #include "circt/Support/LoweringOptionsParser.h"
 #include "circt/Support/Version.h"
+#include "circt/Tools/hlstool/hlstool.h"
+#include "circt/Tools/hlstool/pipelineHLSFlow.h"
 #include "circt/Transforms/Passes.h"
 
 using namespace llvm;
 using namespace mlir;
 using namespace circt;
+using namespace circt::hlstool;
 
 // --------------------------------------------------------------------------
 // Tool options
@@ -99,24 +102,19 @@ static cl::opt<bool>
                  cl::init(true), cl::cat(mainCategory));
 
 static cl::opt<bool>
-    allowUnregisteredDialects("allow-unregistered-dialects",
+    allowUnregisteredDialects("allow-unregistered-dialect",
                               cl::desc("Allow unknown dialects in the input"),
                               cl::init(false), cl::Hidden,
                               cl::cat(mainCategory));
 
-enum HLSFlow {
-  // Compilation through the dynamically scheduled handshake dialect.
-  HLSFlowDynamicHW,
-  // Compilation through Calyx's CIRCT lowering implementation.
-  HLSFlowCalyxHW,
-};
-
-static cl::opt<HLSFlow>
+static cl::opt<HLSFlowOptions>
     hlsFlow(cl::desc("HLS flow"),
             cl::values(clEnumValN(HLSFlowDynamicHW, "dynamic-hw",
                                   "Dynamically scheduled (HW path)"),
                        clEnumValN(HLSFlowCalyxHW, "calyx-hw",
-                                  "Statically scheduled (Calyx path)")),
+                                  "Statically scheduled (Calyx path)"),
+                       clEnumValN(PipelineHLSFlow, "pipeline-hw",
+                                  "Statically scheduled (pipeline path)")),
             cl::cat(mainCategory));
 
 enum DynamicParallelismKind { None, Locking, Pipelining };
@@ -135,21 +133,6 @@ static cl::opt<DynamicParallelismKind> dynParallelism(
                    "pipelined execution of multiple function invocations while "
                    "preserving correctness.")),
     cl::init(Pipelining), cl::cat(mainCategory));
-
-enum IRLevel {
-  // A high-level dialect like affine or scf
-  High,
-  // The IR right before the core lowering dialect
-  PreCompile,
-  // The IR in core dialect
-  Core,
-  // The lowest form of core IR (i.e. after all passes have run)
-  PostCompile,
-  // The IR after lowering is performed
-  RTL,
-  // System verilog representation
-  SV
-};
 
 static cl::opt<IRLevel> irInputLevel(
     "input-level",
@@ -184,8 +167,6 @@ static cl::opt<IRLevel> irOutputLevel(
         clEnumValN(RTL, "rtl", "The IR after lowering is performed"),
         clEnumValN(SV, "sv", "System verilog representation")),
     cl::init(IRLevel::SV), cl::cat(mainCategory));
-
-enum OutputFormatKind { OutputIR, OutputVerilog, OutputSplitVerilog };
 
 static cl::opt<OutputFormatKind> outputFormat(
     cl::desc("Specify output format:"),
@@ -228,14 +209,6 @@ static LoweringOptionsOption loweringOptions(mainCategory);
 // (Configurable) pass pipelines
 // --------------------------------------------------------------------------
 
-/// Create a simple canonicalizer pass.
-static std::unique_ptr<Pass> createSimpleCanonicalizerPass() {
-  mlir::GreedyRewriteConfig config;
-  config.useTopDownTraversal = true;
-  config.enableRegionSimplification = mlir::GreedySimplifyRegionLevel::Disabled;
-  return mlir::createCanonicalizerPass(config);
-}
-
 static void loadDHLSPipeline(OpPassManager &pm) {
   // Memref legalization.
   pm.addPass(circt::createFlattenMemRefPass());
@@ -275,22 +248,6 @@ static void loadESILoweringPipeline(OpPassManager &pm) {
   pm.addPass(circt::esi::createESIPortLoweringPass());
   pm.addPass(circt::esi::createESIPhysicalLoweringPass());
   pm.addPass(circt::esi::createESItoHWPass());
-}
-
-static void loadHWLoweringPipeline(OpPassManager &pm) {
-  pm.addPass(createSimpleCanonicalizerPass());
-  pm.nest<hw::HWModuleOp>().addPass(circt::seq::createLowerSeqHLMemPass());
-  pm.addPass(seq::createHWMemSimImplPass());
-  pm.addPass(circt::createLowerSeqToSVPass());
-  pm.nest<hw::HWModuleOp>().addPass(sv::createHWCleanupPass());
-
-  // Legalize unsupported operations within the modules.
-  pm.nest<hw::HWModuleOp>().addPass(sv::createHWLegalizeModulesPass());
-  pm.addPass(createSimpleCanonicalizerPass());
-
-  // Tidy up the IR to improve verilog emission quality.
-  auto &modulePM = pm.nest<hw::HWModuleOp>();
-  modulePM.addPass(sv::createPrettifyVerilogPass());
 }
 
 // --------------------------------------------------------------------------
@@ -507,6 +464,48 @@ static LogicalResult processBuffer(
       return failure();
     break;
   }
+  case PipelineHLSFlow: {
+    auto flow = pipelineHLSFlow(pm, module.get());
+    bool suppressLaterPasses = false;
+    auto notSuppressed = [&]() { return !suppressLaterPasses; };
+    auto addIfNeeded = [&](llvm::function_ref<bool()> predicate,
+                           llvm::function_ref<void()> passAdder) {
+      if (predicate())
+        passAdder();
+    };
+
+    auto addIRLevel = [&](int level, llvm::function_ref<void()> passAdder) {
+      addIfNeeded(notSuppressed, [&]() {
+        // Add the pass if the input IR level is at least the current
+        // abstraction.
+        if (irInputLevel <= level)
+          passAdder();
+        // Suppresses later passes if we're emitting IR and the output IR level
+        // is the current level.
+        if (outputFormat == OutputIR && irOutputLevel == level)
+          suppressLaterPasses = true;
+      });
+    };
+
+    addIRLevel(IRLevel::PreCompile, [&] { flow.preCompile(); });
+    addIRLevel(IRLevel::Core, [&] { flow.core(); });
+    // addIRLevel(IRLevel::PostCompile, [&] { flow.postCompile(); });
+    // addIRLevel(IRLevel::RTL, [&] { flow.rtl(); });
+    // addIRLevel(IRLevel::SV, [&] { flow.sv(); });
+
+    // if (outputFormat == OutputVerilog) {
+    //   pm.addPass(createExportVerilogPass((*outputFile)->os()));
+    // } else if (outputFormat == OutputSplitVerilog) {
+    //   pm.addPass(createExportSplitVerilogPass(outputFilename));
+    // }
+
+    if (failed(pm.run(module.get())))
+      return failure();
+
+    if (outputFormat == OutputIR)
+      module->print((*outputFile)->os());
+    break;
+  }
   }
 
   // We intentionally "leak" the Module into the MLIRContext instead of
@@ -604,12 +603,14 @@ int main(int argc, char **argv) {
   // Hide default LLVM options, other than for this tool.
   // MLIR options are added below.
   cl::HideUnrelatedOptions(mainCategory);
+  registerPipelineHLSCLOptions();
 
   // Register any pass manager command line options.
   registerMLIRContextCLOptions();
   registerPassManagerCLOptions();
   registerDefaultTimingManagerCLOptions();
   registerAsmPrinterCLOptions();
+  registerHLSToolOptions();
 
   // Parse pass names in main to ensure static initialization completed.
   cl::ParseCommandLineOptions(argc, argv, "CIRCT HLS tool\n");

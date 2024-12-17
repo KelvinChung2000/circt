@@ -26,7 +26,7 @@ def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::F
     problem using the Calyx operator library, solves the problem, and lowers
     the loops to a LoopSchedule.
   }];
-  let constructor = "circt::createAffineToLoopSchedule()";
+
   let dependentDialects = [
     "circt::loopschedule::LoopScheduleDialect",
     "mlir::arith::ArithDialect",
@@ -34,6 +34,10 @@ def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::F
     "mlir::memref::MemRefDialect",
     "mlir::scf::SCFDialect",
     "mlir::func::FuncDialect"
+  ];
+  let options = [
+    Option<"pipelineMode", "pipelineMode", "std::string", "\"inner-most\"", 
+           "Pipeline mode to apply. Possible values are: inner-most (default), full">,
   ];
 }
 
