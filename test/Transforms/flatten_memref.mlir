@@ -108,6 +108,17 @@ func.func @allocs() -> memref<4x4xi32> {
 
 // -----
 
+// CHECK-LABEL:   func @allocas() -> memref<16xi32> {
+// CHECK:           %[[VAL_0:.*]] = memref.alloca() : memref<16xi32>
+// CHECK:           return %[[VAL_0]] : memref<16xi32>
+// CHECK:         }
+func.func @allocas() -> memref<4x4xi32> {
+  %0 = memref.alloca() : memref<4x4xi32>
+  return %0 : memref<4x4xi32>
+}
+
+// -----
+
 // CHECK-LABEL:   func @across_bbs(
 // CHECK:                     %[[VAL_0:.*]]: index, %[[VAL_1:.*]]: index, %[[VAL_2:.*]]: i1) {
 // CHECK:           %[[VAL_3:.*]] = memref.alloc() : memref<16xi32>

@@ -13,6 +13,7 @@
 #include "circt/Transforms/Passes.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -161,6 +162,45 @@ struct StoreOpConversion : public OpConversionPattern<memref::StoreOp> {
   }
 };
 
+struct AffineLoadOpConversion
+    : public OpConversionPattern<affine::AffineLoadOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(affine::AffineLoadOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    MemRefType type = op.getMemRefType();
+    if (isUniDimensional(type) || !type.hasStaticShape() ||
+        /*Already converted?*/ op.getIndices().size() == 1)
+      return failure();
+    Value finalIdx =
+        flattenIndices(rewriter, op, adaptor.getIndices(), op.getMemRefType());
+    auto newOp = rewriter.replaceOpWithNewOp<memref::LoadOp>(
+        op, adaptor.getMemref(), SmallVector<Value>{finalIdx});
+    return success();
+  }
+};
+
+struct AffineStoreOpConversion
+    : public OpConversionPattern<affine::AffineStoreOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(affine::AffineStoreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    MemRefType type = op.getMemRefType();
+    if (isUniDimensional(type) || !type.hasStaticShape() ||
+        /*Already converted?*/ op.getIndices().size() == 1)
+      return failure();
+    Value finalIdx =
+        flattenIndices(rewriter, op, adaptor.getIndices(), op.getMemRefType());
+    rewriter.replaceOpWithNewOp<memref::StoreOp>(op, adaptor.getValue(),
+                                                 adaptor.getMemref(),
+                                                 SmallVector<Value>{finalIdx});
+    return success();
+  }
+};
+
 struct AllocOpConversion : public OpConversionPattern<memref::AllocOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -172,6 +212,20 @@ struct AllocOpConversion : public OpConversionPattern<memref::AllocOp> {
       return failure();
     MemRefType newType = getFlattenedMemRefType(type);
     rewriter.replaceOpWithNewOp<memref::AllocOp>(op, newType);
+    return success();
+  }
+};
+struct AllocaOpConversion : public OpConversionPattern<memref::AllocaOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::AllocaOp op, OpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    MemRefType type = op.getType();
+    if (isUniDimensional(type) || !type.hasStaticShape())
+      return failure();
+    MemRefType newType = getFlattenedMemRefType(type);
+    rewriter.replaceOpWithNewOp<memref::AllocaOp>(op, newType);
     return success();
   }
 };
@@ -329,10 +383,16 @@ static void populateFlattenMemRefsLegality(ConversionTarget &target) {
   target.addLegalDialect<arith::ArithDialect>();
   target.addDynamicallyLegalOp<memref::AllocOp>(
       [](memref::AllocOp op) { return isUniDimensional(op.getType()); });
+  target.addDynamicallyLegalOp<memref::AllocaOp>(
+      [](memref::AllocaOp op) { return isUniDimensional(op.getType()); });
   target.addDynamicallyLegalOp<memref::StoreOp>(
       [](memref::StoreOp op) { return op.getIndices().size() == 1; });
   target.addDynamicallyLegalOp<memref::LoadOp>(
       [](memref::LoadOp op) { return op.getIndices().size() == 1; });
+  target.addDynamicallyLegalOp<affine::AffineStoreOp>(
+      [](affine::AffineStoreOp op) { return op.getIndices().size() == 1; });
+  target.addDynamicallyLegalOp<affine::AffineLoadOp>(
+      [](affine::AffineLoadOp op) { return op.getIndices().size() == 1; });
   target.addDynamicallyLegalOp<memref::GlobalOp>(
       [](memref::GlobalOp op) { return isUniDimensional(op.getType()); });
   target.addDynamicallyLegalOp<memref::GetGlobalOp>(
@@ -402,7 +462,8 @@ public:
 
     RewritePatternSet patterns(ctx);
     SetVector<StringRef> rewrittenCallees;
-    patterns.add<LoadOpConversion, StoreOpConversion, AllocOpConversion,
+    patterns.add<LoadOpConversion, AffineLoadOpConversion, StoreOpConversion,
+                 AffineStoreOpConversion, AllocOpConversion, AllocaOpConversion,
                  GlobalOpConversion, GetGlobalOpConversion,
                  OperandConversionPattern<func::ReturnOp>,
                  OperandConversionPattern<memref::DeallocOp>,
