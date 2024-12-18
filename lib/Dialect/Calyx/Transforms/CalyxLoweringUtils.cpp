@@ -499,7 +499,6 @@ FuncOpPartialLoweringPattern::partiallyLower(mlir::func::FuncOp funcOp,
         calyxLoweringState.getState<ComponentLoweringStateInterface>(
             componentOp);
   }
-
   return partiallyLowerFuncToComp(funcOp, rewriter);
 }
 

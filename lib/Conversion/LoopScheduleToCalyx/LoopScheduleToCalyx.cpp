@@ -211,6 +211,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
+
     /// We walk the operations of the funcOp to ensure that all def's have
     /// been visited before their uses.
     bool opBuiltSuccessfully = true;
@@ -242,7 +243,6 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       return opBuiltSuccessfully ? WalkResult::advance()
                                  : WalkResult::interrupt();
     });
-
     return success(opBuiltSuccessfully);
   }
 
@@ -757,6 +757,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
+
     /// Maintain a mapping between funcOp input arguments and the port index
     /// which the argument will eventually map to.
     DenseMap<Value, unsigned> funcOpArgRewrites;
@@ -868,6 +869,7 @@ class BuildWhileGroups : public calyx::FuncOpPartialLoweringPattern {
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
+
     LogicalResult res = success();
     funcOp.walk([&](Operation *op) {
       if (!isa<LoopSchedulePipelineOp>(op))
@@ -936,6 +938,7 @@ class BuildPipelineRegs : public calyx::FuncOpPartialLoweringPattern {
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
+
     funcOp.walk([&](LoopScheduleRegisterOp op) {
       // Condition registers are handled in BuildWhileGroups.
       auto *parent = op->getParentOp();
@@ -996,6 +999,9 @@ class BuildPipelineGroups : public calyx::FuncOpPartialLoweringPattern {
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
+
+    llvm::outs() << funcOp << "\n";
+
     for (auto pipeline : funcOp.getOps<LoopSchedulePipelineOp>())
       for (auto stage :
            pipeline.getStagesBlock().getOps<LoopSchedulePipelineStageOp>())
@@ -1051,6 +1057,16 @@ class BuildPipelineGroups : public calyx::FuncOpPartialLoweringPattern {
           updatePrologueAndEpilogue(*group);
     }
 
+    // llvm::outs() << "\nStage: \n" << stage << "\n";
+    // llvm::outs() << "\nwhileOp: \n" << whileOp << "\n";
+    // llvm::outs() << "\nPipeline Registers for Stage " <<
+    // stage.getStageNumber()
+    //              << ":\n";
+    // for (const auto &reg : pipelineRegisters) {
+    //   llvm::outs() << "  Index: " << reg.first << ", Register: " <<
+    //   reg.second
+    //                << "\n";
+    // }
     for (auto &operand : operands) {
       unsigned i = operand.getOperandNumber();
       Value value = operand.get();
@@ -1058,8 +1074,8 @@ class BuildPipelineGroups : public calyx::FuncOpPartialLoweringPattern {
       // Get the pipeline register for that result.
       auto pipelineRegister = pipelineRegisters[i];
 
-      llvm::outs() << "Pipeline register: " << pipelineRegister << "\n";
-      llvm::outs() << "Value: " << value << "\n";
+      // llvm::outs() << "Pipeline register: " << pipelineRegister << "\n";
+      // llvm::outs() << "Value: " << value << "\n\n";
 
       // Get the evaluating group for that value.
       calyx::GroupInterface evaluatingGroup =
@@ -1163,6 +1179,7 @@ class BuildControl : public calyx::FuncOpPartialLoweringPattern {
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
+
     auto *entryBlock = &funcOp.getBlocks().front();
     rewriter.setInsertionPointToStart(
         getComponent().getControlOp().getBodyBlock());
@@ -1633,6 +1650,7 @@ void LoopScheduleToCalyxPass::runOnOperation() {
     LogicalResult partialPatternRes = runPartialPattern(
         pat.pattern,
         /*runOnce=*/pat.strategy == LoweringPattern::Strategy::Once);
+    // getOperation()->dump();
     if (succeeded(partialPatternRes))
       continue;
     signalPassFailure();

@@ -16,6 +16,9 @@
 #include "mlir/Support/ToolUtilities.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
+#include <fstream>
+
+#include "llvm/Support/Debug.h"
 
 #include "circt/Conversion/AffineToLoopSchedule.h"
 #include "circt/Conversion/CalyxToFSM.h"
@@ -33,43 +36,72 @@
 #include "circt/Tools/hlstool/pipelineHLSFlow.h"
 #include "circt/Transforms/Passes.h"
 
+#define DEBUG_TYPE "pipelineHLSFlow"
 using namespace llvm;
 using namespace mlir;
 using namespace circt;
 using namespace circt::hlstool;
 
-static cl::OptionCategory pipelineFlowCategory("Pipeline Flow Options");
-
 namespace {
 
-// enum pipelineOptions {
-//   // fully pipeline all loops
-//   FullPipeline,
-//   // pipeline only the  inner most loop
-//   InnerMostPipeline,
-// };
-
+static cl::OptionCategory pipelineFlowCategory("Pipeline Flow Options");
 struct pipelineHLSFlowOptions {
   cl::opt<std::string> pipelineModeOpt{
-      "pipeline-mode", cl::desc("Pipeline mode options: full, inner-most"),
+      "pipeline-mode", cl::desc("Pipeline mode: full, inner-most"),
       cl::init("inner-most"), cl::cat(pipelineFlowCategory)};
+
+  cl::opt<std::string> opCycleMapFile{
+      "op-cycle-map",
+      cl::desc("A directory that contains the operation cycle information"),
+      cl::init(""), cl::cat(pipelineFlowCategory)};
 };
 
 } // namespace
 static ManagedStatic<pipelineHLSFlowOptions> clOpts;
 void hlstool::registerPipelineHLSCLOptions() { *clOpts; }
 
+std::map<std::string, int>
+pipelineHLSFlow::parseCycleOpMap(std::string opCycleMapFile) {
+  std::map<std::string, int> cycleMap;
+  if (opCycleMapFile.empty())
+    return cycleMap;
+
+  // Parse the cycle map file
+  std::ifstream cycleMapFile(opCycleMapFile);
+  if (!cycleMapFile.is_open()) {
+    llvm::errs() << "Failed to open the cycle map file: " << opCycleMapFile;
+    exit(1);
+  }
+
+  std::string line;
+  while (std::getline(cycleMapFile, line)) {
+    std::istringstream iss(line);
+    std::string opName;
+    int cycle;
+    if (std::getline(iss, opName, ':') && (iss >> cycle)) {
+      cycleMap[opName] = cycle;
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Operation: " << opName << " cycles: " << cycle << "\n");
+    } else {
+      llvm::errs() << "Failed to parse line: " << line << "\n";
+      exit(1);
+    }
+  }
+
+  return cycleMap;
+}
+
 void pipelineHLSFlow::preCompile() {
   auto hlsflags = hlsFlags();
-  // pm.addPass(mlir::createLowerAffinePass());
-  // pm.addPass(mlir::createConvertSCFToCFPass());
+
+  pm.nest<func::FuncOp>().addPass(circt::createAffineToLoopSchedule(
+      {clOpts->pipelineModeOpt, parseCycleOpMap(clOpts->opCycleMapFile)}));
+  pm.addPass(mlir::createLowerAffinePass());
+  pm.addPass(mlir::createConvertSCFToCFPass());
 }
 
 void pipelineHLSFlow::core() {
-  pm.nest<func::FuncOp>().addPass(
-      circt::createAffineToLoopSchedule({clOpts->pipelineModeOpt}));
-  pm.addPass(mlir::createLowerAffinePass());
-  pm.addPass(mlir::createConvertSCFToCFPass());
+
   pm.addPass(circt::createLoopScheduleToCalyxPass());
   // pm.addPass(circt::createSCFToCalyxPass());
 }

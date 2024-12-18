@@ -67,6 +67,10 @@ private:
   lowerAffineStructures(MemoryDependenceAnalysis &dependenceAnalysis);
   LogicalResult populateOperatorTypes(SmallVectorImpl<AffineForOp> &loopNest,
                                       ModuloProblem &problem);
+  LogicalResult
+  populateOperatorTypesCustom(SmallVectorImpl<AffineForOp> &loopNest,
+                              ModuloProblem &problem);
+
   LogicalResult solveSchedulingProblem(SmallVectorImpl<AffineForOp> &loopNest,
                                        ModuloProblem &problem);
   LogicalResult
@@ -131,13 +135,17 @@ void AffineToLoopSchedule::runOnOperation() {
     // // Restrict to single loops to simplify things for now.
     // if (nestedLoops.size() != 1)
     //   continue;
-
     ModuloProblem moduloProblem =
         getModuloProblem(schedulingAnalysis->getProblem(nestedLoops.back()));
 
     // Populate the target operator types.
-    if (failed(populateOperatorTypes(nestedLoops, moduloProblem)))
-      return signalPassFailure();
+    if (opCycleMap.empty()) {
+      if (failed(populateOperatorTypes(nestedLoops, moduloProblem)))
+        return signalPassFailure();
+    } else {
+      if (failed(populateOperatorTypesCustom(nestedLoops, moduloProblem)))
+        return signalPassFailure();
+    }
 
     // Solve the scheduling problem computed by the analysis.
     if (failed(solveSchedulingProblem(nestedLoops, moduloProblem)))
@@ -292,7 +300,6 @@ LogicalResult AffineToLoopSchedule::populateOperatorTypes(
     SmallVectorImpl<AffineForOp> &loopNest, ModuloProblem &problem) {
   // Scheduling analyis only considers the innermost loop nest for now.
   auto forOp = loopNest.back();
-
   // Load the Calyx operator library into the problem. This is a very minimal
   // set of arithmetic and memory operators for now. This should ultimately be
   // pulled out into some sort of dialect interface.
@@ -355,6 +362,34 @@ LogicalResult AffineToLoopSchedule::populateOperatorTypes(
           unsupported = op;
           return WalkResult::interrupt();
         });
+  });
+
+  if (result.wasInterrupted())
+    return forOp.emitError("unsupported operation ") << *unsupported;
+
+  return success();
+}
+
+LogicalResult AffineToLoopSchedule::populateOperatorTypesCustom(
+    SmallVectorImpl<AffineForOp> &loopNest, ModuloProblem &problem) {
+
+  auto forOp = loopNest.back();
+  Operation *unsupported;
+
+  WalkResult result = forOp.getBody()->walk([&](Operation *op) {
+    std::string opString = op->getName().getStringRef().str();
+
+    if (opCycleMap.find(opString) != opCycleMap.end()) {
+      Problem::OperatorType customOpr =
+          problem.getOrInsertOperatorType(opString);
+      problem.setLatency(customOpr, opCycleMap[opString]);
+      problem.setLinkedOperatorType(op, customOpr);
+    } else {
+      unsupported = op;
+      return WalkResult::interrupt();
+    }
+
+    return WalkResult::advance();
   });
 
   if (result.wasInterrupted())
@@ -614,19 +649,21 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
       stageOperands.push_back(stageValueMaps[startTime].lookup(res));
       // Additionally, update the map of the stage that will consume the
       // registered value
-      unsigned destTime = startTime + 1;
       unsigned latency = *problem.getLatency(
           *problem.getLinkedOperatorType(res.getDefiningOp()));
-      // Multi-cycle case
-      if (*problem.getStartTime(res.getDefiningOp()) == startTime &&
-          latency > 1)
-        destTime = startTime + latency;
+      unsigned destTime = startTime + std::max((unsigned)1, latency);
 
+      // map where the value will first available
+      stageValueMaps[destTime].map(res, stage.getResult(resIndex));
+
+
+      // map plumbing registers upto all the users of the value
       for (auto user : res.getUsers()) {
         destTime = *problem.getStartTime(user);
         for (unsigned i = startTime + latency; i <= destTime; ++i) {
           stageValueMaps[i].map(res, stage.getResult(resIndex));
-          LLVM_DEBUG(llvm::outs() << "Map at time " << i << " " << res << "\n");
+          LLVM_DEBUG(llvm::outs()
+                     << "Map at time " << i << " for res:" << res << "\n");
         }
       }
       resIndex++;
@@ -660,7 +697,8 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   for (auto value : forOp.getBody()->getTerminator()->getOperands()) {
     unsigned lookupTime = std::min((unsigned)(stageValueMaps.size() - 1),
                                    pipeTimes[value.getDefiningOp()].second);
-
+    llvm::outs() << "Lookup time: " << lookupTime << "\n";
+    llvm::outs() << "Value: " << value << "\n";
     termIterArgs.push_back(stageValueMaps[lookupTime].lookup(value));
     termResults.push_back(stageValueMaps[lookupTime].lookup(value));
   }

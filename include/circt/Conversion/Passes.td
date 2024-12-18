@@ -38,6 +38,9 @@ def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::F
   let options = [
     Option<"pipelineMode", "pipelineMode", "std::string", "\"inner-most\"", 
            "Pipeline mode to apply. Possible values are: inner-most (default), full">,
+    Option<"opCycleMap", "opCycleMap", "std::map<std::string, int>", "", 
+           "A file path to a newline separated list of <op>:<cycle> pairs to override the cycle count for an operation."
+           "If not specified, the cycle count will be based on Calyx library Op.">,
   ];
 }
 

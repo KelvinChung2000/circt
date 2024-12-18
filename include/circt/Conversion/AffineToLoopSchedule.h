@@ -11,6 +11,7 @@
 #define CIRCT_CONVERSION_AFFINETOLOOPSCHEDULE_H_
 
 #include "circt/Support/LLVM.h"
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,7 +24,6 @@ namespace circt {
 
 #define GEN_PASS_DECL_AFFINETOLOOPSCHEDULE
 #include "circt/Conversion/Passes.h.inc"
-
 
 } // namespace circt
 

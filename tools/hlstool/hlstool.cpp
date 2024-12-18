@@ -633,7 +633,7 @@ int main(int argc, char **argv) {
   // Register CIRCT dialects.
   registry.insert<hw::HWDialect, comb::CombDialect, seq::SeqDialect,
                   sv::SVDialect, handshake::HandshakeDialect, esi::ESIDialect,
-                  calyx::CalyxDialect>();
+                  calyx::CalyxDialect, loopschedule::LoopScheduleDialect>();
 
   // Do the guts of the hlstool process.
   MLIRContext context(registry);

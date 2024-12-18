@@ -11,8 +11,9 @@ static cl::OptionCategory GeneralHLSCategory("HLS Options 2");
 
 namespace {
 struct hlstoolOptions {
-  cl::opt<std::string> kernel{"kernel", cl::desc("Name of the kernel function"),
-                              cl::init(""), cl::cat(GeneralHLSCategory)};
+  // cl::opt<std::string> kernel{"kernel", cl::desc("Name of the kernel
+  // function"),
+  //                             cl::init(""), cl::cat(GeneralHLSCategory)};
 };
 
 } // namespace
@@ -20,4 +21,6 @@ struct hlstoolOptions {
 ManagedStatic<hlstoolOptions> hlstoolcl;
 void hlstool::registerHLSToolOptions() { *hlstoolcl; }
 
-hlsFlags::hlsFlags() { kernel = hlstoolcl->kernel; }
+hlsFlags::hlsFlags() {
+  // kernel = hlstoolcl->kernel;
+}

@@ -21,6 +21,10 @@ public:
   void postCompile() override;
   void rtl() override;
   void sv() override;
+
+private: 
+  std::map<std::string, int> parseCycleOpMap(std::string opCycleMap);
+
 };
 
 void registerPipelineHLSCLOptions();
