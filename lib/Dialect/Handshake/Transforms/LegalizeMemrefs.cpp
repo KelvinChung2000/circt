@@ -34,6 +34,7 @@ using namespace mlir;
 
 namespace {
 
+
 struct HandshakeLegalizeMemrefsPass
     : public circt::handshake::impl::HandshakeLegalizeMemrefsBase<
           HandshakeLegalizeMemrefsPass> {
@@ -92,6 +93,16 @@ struct HandshakeLegalizeMemrefsPass
         emitLoadStore(b.create<arith::ConstantIndexOp>(loc, 0));
 
       copy.erase();
+    }
+
+    // Convert any memref.alloca to memref.alloc operations.
+    for (auto alloca :
+         llvm::make_early_inc_range(op.getOps<memref::AllocaOp>())){
+      
+      b.setInsertionPoint(alloca);
+      auto op = b.create<memref::AllocOp>(alloca.getLoc(), alloca.getType());
+      alloca.getResult().replaceAllUsesWith(op);
+      alloca.erase();
     }
   };
 };
