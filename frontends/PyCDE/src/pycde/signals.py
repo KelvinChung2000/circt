@@ -13,7 +13,7 @@ from .circt import ir
 
 from contextvars import ContextVar
 from functools import singledispatchmethod
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import re
 import numpy as np
 
@@ -336,7 +336,7 @@ class BitsSignal(BitVectorSignal):
     return self.slice(idx, 1)
 
   @staticmethod
-  def concat(items: List[BitVectorSignal]):
+  def concat(items: Iterable[BitVectorSignal]):
     """Concatenate a list of bitvectors into one larger bitvector."""
     from .dialects import comb
     return comb.ConcatOp(*items)
@@ -748,6 +748,13 @@ class ChannelSignal(Signal):
             stages=stages,
         ), self.type)
 
+  def snoop(self) -> Tuple[Bits(1), Bits(1), Type]:
+    """Combinationally snoop on the internal signals of a channel."""
+    from .dialects import esi
+    assert self.type.signaling == ChannelSignaling.ValidReady, "Only valid-ready channels can be snooped currently"
+    snoop = esi.SnoopValidReadyOp(self.value)
+    return snoop[0], snoop[1], snoop[2]
+
   def transform(self, transform: Callable[[Signal], Signal]) -> ChannelSignal:
     """Transform the data in the channel using the provided function. Said
     function must be combinational so it is intended for wire and simple type
@@ -809,8 +816,9 @@ class BundleSignal(Signal):
       raise ValueError(
           f"Missing channel values for {', '.join(from_channels.keys())}")
 
-    unpack_op = esi.UnpackBundleOp([bc.channel._type for bc in to_channels],
-                                   self.value, operands)
+    with get_user_loc():
+      unpack_op = esi.UnpackBundleOp([bc.channel._type for bc in to_channels],
+                                     self.value, operands)
 
     to_channels_results = unpack_op.toChannels
     ret = {

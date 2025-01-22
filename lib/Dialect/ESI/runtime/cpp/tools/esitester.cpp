@@ -99,27 +99,63 @@ void registerCallbacks(AcceleratorConnection *conn, Accelerator *accel) {
   }
 }
 
+void dmaTest(Accelerator *acc, uint64_t *dataPtr, uint32_t width) {
+  std::cout << "Running DMA test with width " << width << std::endl;
+
+  // Initiate a test read.
+  auto *readMem = acc->getChildren()
+                      .at(AppID("readmem", width))
+                      ->getPorts()
+                      .at(AppID("ReadMem"))
+                      .getAs<services::MMIO::MMIORegion>();
+
+  for (size_t i = 0; i < 8; ++i) {
+    dataPtr[0] = 0x12345678 << i;
+    dataPtr[1] = 0xDEADBEEF << i;
+    readMem->write(8, (uint64_t)dataPtr);
+
+    // Wait for the accelerator to read the correct value. Timeout and fail
+    // after 10ms.
+    uint64_t val = 0;
+    uint64_t expected = dataPtr[0];
+    if (width < 64)
+      expected &= ((1ull << width) - 1);
+    for (int i = 0; i < 100; ++i) {
+      val = readMem->read(0);
+      if (val == expected)
+        break;
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    if (val != expected)
+      throw std::runtime_error("DMA read test failed. Expected " +
+                               std::to_string(expected) + ", got " +
+                               std::to_string(val));
+  }
+
+  // Initiate a test write.
+  auto *writeMem =
+      acc->getPorts().at(AppID("WriteMem")).getAs<services::MMIO::MMIORegion>();
+  *dataPtr = 0;
+  writeMem->write(0, (uint64_t)dataPtr);
+  // Wait for the accelerator to write. Timeout and fail after 10ms.
+  for (int i = 0; i < 100; ++i) {
+    if (*dataPtr != 0)
+      break;
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+  if (*dataPtr == 0)
+    throw std::runtime_error("DMA write test failed");
+}
+
 void dmaTest(AcceleratorConnection *conn, Accelerator *acc) {
   // Enable the host memory service.
   auto hostmem = conn->getService<services::HostMem>();
   hostmem->start();
+  auto scratchRegion = hostmem->allocate(/*size(bytes)=*/32, /*memOpts=*/{});
+  uint64_t *dataPtr = static_cast<uint64_t *>(scratchRegion->getPtr());
 
-  // Initiate a test read.
-  auto *readMem =
-      acc->getPorts().at(AppID("ReadMem")).getAs<services::MMIO::MMIORegion>();
-  uint64_t *dataPtr = new uint64_t;
-  *dataPtr = 0x12345678;
-  readMem->write(8, (uint64_t)dataPtr);
-
-  // Wait for the accelerator to read the correct value. Timeout and fail after
-  // 10ms.
-  uint64_t val = 0;
-  for (int i = 0; i < 100; ++i) {
-    val = readMem->read(0);
-    if (val == *dataPtr)
-      break;
-    std::this_thread::sleep_for(std::chrono::microseconds(100));
-  }
-  if (val != *dataPtr)
-    throw std::runtime_error("DMA test failed");
+  dmaTest(acc, dataPtr, 32);
+  dmaTest(acc, dataPtr, 64);
+  dmaTest(acc, dataPtr, 96);
 }
