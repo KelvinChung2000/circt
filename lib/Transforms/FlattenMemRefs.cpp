@@ -74,7 +74,6 @@ static Value flattenIndices(ConversionPatternRewriter &rewriter, Operation *op,
     return rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0))
         .getResult();
   }
-
   Value finalIdx = indices.front();
   for (auto memIdx : llvm::enumerate(indices.drop_front())) {
     Value partialIdx = memIdx.value();
@@ -172,6 +171,21 @@ struct AllocOpConversion : public OpConversionPattern<memref::AllocOp> {
       return failure();
     MemRefType newType = getFlattenedMemRefType(type);
     rewriter.replaceOpWithNewOp<memref::AllocOp>(op, newType);
+    return success();
+  }
+};
+
+struct AllocaOpConversion : public OpConversionPattern<memref::AllocaOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::AllocaOp op, OpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    MemRefType type = op.getType();
+    if (isUniDimensional(type) || !type.hasStaticShape())
+      return failure();
+    MemRefType newType = getFlattenedMemRefType(type);
+    rewriter.replaceOpWithNewOp<memref::AllocaOp>(op, newType);
     return success();
   }
 };
@@ -329,6 +343,8 @@ static void populateFlattenMemRefsLegality(ConversionTarget &target) {
   target.addLegalDialect<arith::ArithDialect>();
   target.addDynamicallyLegalOp<memref::AllocOp>(
       [](memref::AllocOp op) { return isUniDimensional(op.getType()); });
+  target.addDynamicallyLegalOp<memref::AllocaOp>(
+      [](memref::AllocaOp op) { return isUniDimensional(op.getType()); });
   target.addDynamicallyLegalOp<memref::StoreOp>(
       [](memref::StoreOp op) { return op.getIndices().size() == 1; });
   target.addDynamicallyLegalOp<memref::LoadOp>(
@@ -403,7 +419,7 @@ public:
     RewritePatternSet patterns(ctx);
     SetVector<StringRef> rewrittenCallees;
     patterns.add<LoadOpConversion, StoreOpConversion, AllocOpConversion,
-                 GlobalOpConversion, GetGlobalOpConversion,
+                 AllocaOpConversion, GlobalOpConversion, GetGlobalOpConversion,
                  OperandConversionPattern<func::ReturnOp>,
                  OperandConversionPattern<memref::DeallocOp>,
                  CondBranchOpConversion,
