@@ -713,6 +713,16 @@ public:
   partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
                            PatternRewriter &rewriter) const = 0;
 
+  /// Override this to bypass top-level function filtering. By default, patterns
+  /// only process the top-level function specified by --top-level-function.
+  /// Return true to process all functions.
+  virtual bool shouldProcessAllFunctions() const { return false; }
+
+  /// Override this to enable top-level function filtering. By default, patterns
+  /// process any function that has a component created for it.
+  /// Return true to only process the top-level function.
+  virtual bool shouldOnlyProcessTopLevelFunction() const { return false; }
+
 protected:
   // A map from FuncOp to it's respective ComponentOp lowering.
   DenseMap<mlir::func::FuncOp, calyx::ComponentOp> &functionMapping;

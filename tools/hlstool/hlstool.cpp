@@ -20,6 +20,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Parser/Parser.h"
@@ -417,9 +418,17 @@ static LogicalResult doHLSFlowCalyx(
 
   // Lower to only SCF abstractions
   addIRLevel(IRLevel::PreCompile, [&]() {
-    /* Nothing to do */
+    pm.addPass(mlir::createLowerAffinePass());
+    pm.addPass(circt::createFlattenMemRefPass());
+    pm.addPass(mlir::createLoopInvariantSubsetHoistingPass());
+    pm.addPass(mlir::createLoopInvariantCodeMotionPass());
+    pm.addPass(mlir::createForToWhileLoopPass());
+    pm.addPass(mlir::createSROA());
+    pm.addPass(mlir::createSCCPPass());
+    pm.addPass(mlir::createCSEPass());
+    pm.addPass(mlir::createTopologicalSortPass());
+    pm.addPass(createSimpleCanonicalizerPass());
   });
-
   // Lower to Calyx
   addIRLevel(IRLevel::Core, [&]() {
     pm.addPass(circt::createSCFToCalyxPass(topLevelFunction));

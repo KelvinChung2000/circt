@@ -186,7 +186,8 @@ public:
   void setResultRegs(scf::IfOp op, calyx::RegisterOp reg, unsigned idx) {
     assert(resultRegs[op.getOperation()].count(idx) == 0 &&
            "A register was already registered for the given yield result.\n");
-    assert(idx < op->getNumOperands());
+    assert(idx < op->getNumResults() &&
+           "Index out of bounds for the yield results.\n");
     resultRegs[op.getOperation()][idx] = reg;
   }
 
@@ -474,14 +475,25 @@ private:
         getState<ComponentLoweringState>().setCondReg(ifOp, condReg);
     }
 
-    assert(
-        lhsIsSeqOp != rhsIsSeqOp &&
-        "unexpected sequential operation on both sides; please open an issue");
     // If `cmpIOp`'s lhs/rhs operand is the result of a sequential operation,
     // its result will be stored in a register.
-    resReg =
-        cast<calyx::RegisterOp>(lhsIsSeqOp ? cmpIOp.getLhs().getDefiningOp()
-                                           : cmpIOp.getRhs().getDefiningOp());
+    if (lhsIsSeqOp && rhsIsSeqOp) {
+      // Both sides are sequential - check if they're already registers
+      if (auto regOp = dyn_cast_or_null<calyx::RegisterOp>(cmpIOp.getLhs().getDefiningOp())) {
+        resReg = regOp;
+      } else if (auto regOp = dyn_cast_or_null<calyx::RegisterOp>(cmpIOp.getRhs().getDefiningOp())) {
+        resReg = regOp;
+      }
+      // If neither is a register yet, we'll let the normal flow handle it
+    } else if (lhsIsSeqOp) {
+      if (auto regOp = dyn_cast_or_null<calyx::RegisterOp>(cmpIOp.getLhs().getDefiningOp())) {
+        resReg = regOp;
+      }
+    } else if (rhsIsSeqOp) {
+      if (auto regOp = dyn_cast_or_null<calyx::RegisterOp>(cmpIOp.getRhs().getDefiningOp())) {
+        resReg = regOp;
+      }
+    }
 
     auto groupOp = cast<calyx::GroupOp>(group);
     getState<ComponentLoweringState>().addBlockScheduleable(cmpIOp->getBlock(),
@@ -509,15 +521,17 @@ private:
 
   template <typename CmpILibOp>
   LogicalResult buildCmpIOpHelper(PatternRewriter &rewriter, CmpIOp op) const {
-    bool isIfOpGuard = std::any_of(op->getUsers().begin(), op->getUsers().end(),
-                                   [](auto op) { return isa<scf::IfOp>(op); });
-    bool isSeqCondCheck = isIfOpGuard && (calyx::parentIsSeqCell(op.getLhs()) ||
-                                          calyx::parentIsSeqCell(op.getRhs()));
+    bool hasSeqOperands = calyx::parentIsSeqCell(op.getLhs()) ||
+                          calyx::parentIsSeqCell(op.getRhs());
 
-    if (isSeqCondCheck)
+    // Use GroupOp (sequential) if any operand comes from a sequential operation
+    // Use CombGroupOp (combinational) only if all operands are combinational
+    if (hasSeqOperands)
       return buildLibraryOp<calyx::GroupOp, CmpILibOp>(rewriter, op);
     return buildLibraryOp<calyx::CombGroupOp, CmpILibOp>(rewriter, op);
   }
+
+
 
   /// buildLibraryOp will build a TCalyxLibOp inside a TGroupOp based on the
   /// source operation TSrcOp.
@@ -562,9 +576,7 @@ private:
     rewriter.setInsertionPointToEnd(group.getBodyBlock());
 
     for (auto dstOp : enumerate(opInputPorts)) {
-      auto srcOp = calyx::parentIsSeqCell(dstOp.value())
-                       ? condReg.getOut()
-                       : op->getOperand(dstOp.index());
+      Value srcOp = op->getOperand(dstOp.index());
       rewriter.create<calyx::AssignOp>(op.getLoc(), dstOp.value(), srcOp);
     }
 
@@ -1880,6 +1892,9 @@ class InlineExecuteRegionOpPattern
 struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
 
+  /// FuncOpConversion needs to run on ALL functions to create components
+  bool shouldProcessAllFunctions() const override { return true; }
+
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
@@ -1979,7 +1994,13 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
         auto memOp = rewriter.create<calyx::SeqMemoryOp>(
             funcOp.getLoc(), memName,
             memtype.getElementType().getIntOrFloatBitWidth(), sizes, addrSizes);
-        // we don't set the memory to "external", which implies it's a reference
+        // If this is the toplevel component (main), make memories external (owned)
+        // rather than references, since there's no parent to reference from
+        if (compOp.getName() == loweringState().getTopLevelFunction()) {
+          memOp->setAttr("external",
+                         IntegerAttr::get(rewriter.getI1Type(), llvm::APInt(1, 1)));
+        }
+        // Otherwise, we don't set the memory to "external", which implies it's a reference
 
         compState->registerMemoryInterface(arg.value(),
                                            calyx::MemoryInterface(memOp));
@@ -2204,9 +2225,33 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
 class BuildControl : public calyx::FuncOpPartialLoweringPattern {
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
 
+  /// BuildControl should process any function that has a component and groups
+  /// to avoid empty control regions
+  bool shouldProcessAllFunctions() const override { return true; }
+
   LogicalResult
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
+    // Check if this function has any scheduleable groups
+    // If not, skip control generation to avoid empty control regions
+    bool hasScheduleables = false;
+    for (auto &block : funcOp.getBlocks()) {
+      auto compBlockScheduleables =
+          getState<ComponentLoweringState>().getBlockScheduleables(&block);
+      if (!compBlockScheduleables.empty()) {
+        hasScheduleables = true;
+        break;
+      }
+    }
+    
+    if (!hasScheduleables) {
+      // Create a minimal control structure for functions with no scheduleable groups
+      // This ensures the component has valid control flow even when empty
+      rewriter.setInsertionPointToStart(
+          getComponent().getControlOp().getBodyBlock());
+      rewriter.create<calyx::SeqOp>(funcOp.getLoc());
+      return success();
+    }
     auto *entryBlock = &funcOp.getBlocks().front();
     rewriter.setInsertionPointToStart(
         getComponent().getControlOp().getBodyBlock());
@@ -2397,11 +2442,22 @@ private:
         SmallVector<Value, 4> instancePorts;
         SmallVector<Value, 4> inputPorts;
         SmallVector<Attribute, 4> refCells;
+        SmallVector<Attribute, 4> portNames;
+        SmallVector<Attribute, 4> inputNames;
+        
+        // Handle input ports and their values  
         for (auto operandEnum : enumerate(callSchedPtr->callOp.getOperands())) {
           auto operand = operandEnum.value();
           auto index = operandEnum.index();
           if (!isa<MemRefType>(operand.getType())) {
             inputPorts.push_back(operand);
+            // Get the corresponding input port of the instance
+            instancePorts.push_back(instanceOp.getResult(index));
+            // Add port name for input
+            auto portInfos = instanceOp.getReferencedComponent().getPortInfo();
+            if (index < portInfos.size()) {
+              portNames.push_back(rewriter.getStringAttr(portInfos[index].name.str()));
+            }
             continue;
           }
 
@@ -2422,16 +2478,17 @@ private:
                 DictionaryAttr::get(rewriter.getContext(), namedAttrList));
           }
         }
-        llvm::copy(instanceOp.getResults().take_front(inputPorts.size()),
-                   std::back_inserter(instancePorts));
 
         ArrayAttr refCellsAttr =
             ArrayAttr::get(rewriter.getContext(), refCells);
+        ArrayAttr portNamesAttr =
+            ArrayAttr::get(rewriter.getContext(), portNames);
+        ArrayAttr inputNamesAttr =
+            ArrayAttr::get(rewriter.getContext(), inputNames);
 
         rewriter.create<calyx::InvokeOp>(
             instanceOp.getLoc(), instanceOp.getSymName(), instancePorts,
-            inputPorts, refCellsAttr, ArrayAttr::get(rewriter.getContext(), {}),
-            ArrayAttr::get(rewriter.getContext(), {}));
+            inputPorts, refCellsAttr, portNamesAttr, inputNamesAttr);
       } else
         llvm_unreachable("Unknown scheduleable");
     }
@@ -2933,20 +2990,10 @@ private:
         });
 
     if (hasMemrefArgsInTopLevel) {
-      auto newTopLevelFunc = createNewTopLevelFn(moduleOp, topLevelFunction);
-      if (!newTopLevelFunc)
-        return failure();
-
-      OpBuilder builder(moduleOp.getContext());
-      Operation *oldTopLevelFuncOp =
-          SymbolTable::lookupSymbolIn(moduleOp, topLevelFunction);
-      if (auto oldTopLevelFunc = dyn_cast<FuncOp>(oldTopLevelFuncOp))
-        insertCallFromNewTopLevel(builder, newTopLevelFunc, oldTopLevelFunc);
-      else {
-        moduleOp.emitOpError("Original top-level function not found!");
-        return failure();
-      }
-      topLevelFunction = "main";
+      // Instead of creating a wrapper main, keep the original function name
+      // and let it be marked as toplevel directly. The function will be 
+      // converted to a component with the same name and marked as toplevel.
+      // No renaming is needed since the original function name is preserved.
     }
 
     return success();

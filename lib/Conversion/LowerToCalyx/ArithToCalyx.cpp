@@ -1,0 +1,406 @@
+//===- ArithToCalyx.cpp - Arith to Calyx Conversion --------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file contains the template implementations for converting arith
+// operations to Calyx.
+//
+//===----------------------------------------------------------------------===//
+
+#include "LowerToCalyxUtil.h"
+#include "circt/Dialect/Calyx/CalyxOps.h"
+#include "circt/Dialect/HW/HWOps.h"
+#include "convertPattern.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/DialectConversion.h"
+
+// Forward declaration from LowerToCalyx.cpp
+namespace circt {
+namespace lowertocalyx {
+std::string getOpUniqueName(mlir::Operation *op);
+}
+} // namespace circt
+
+using namespace circt;
+using namespace circt::lowertocalyx;
+using namespace mlir;
+
+namespace circt {
+namespace lowertocalyx {
+
+// Template function implementation for binary operations
+template <typename SourceType, typename TargetType>
+LogicalResult
+ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
+    SourceType op, typename SourceType::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+
+  // Get operation location and operands
+  auto loc = op.getLoc();
+  Value lhs = adaptor.getLhs();
+  Value rhs = adaptor.getRhs();
+
+  // Get the result type width
+  auto resultType = op.getResult().getType();
+  auto intType = dyn_cast<IntegerType>(resultType);
+  if (!intType) {
+    return rewriter.notifyMatchFailure(op, "Only integer types supported");
+  }
+
+  // Create a simple symbol name using the general utility function
+  std::string symName = getOpUniqueName(op);
+
+  // Create result types: left input, right input, output (all same width for
+  // binary ops)
+  SmallVector<Type> resultTypes = {resultType, resultType, resultType};
+
+  // Find the parent component to create library operations at the component
+  // level
+  auto componentOp = op->template getParentOfType<calyx::ComponentOp>();
+  if (!componentOp) {
+    return rewriter.notifyMatchFailure(
+        op, "Arithmetic operation not within a calyx.component");
+  }
+
+  // Create the library operation at the component level (before wires section)
+  // Find the wires operation and insert before it
+  auto wiresOp =
+      *componentOp.getBodyBlock()->template getOps<calyx::WiresOp>().begin();
+  OpBuilder componentBuilder(rewriter.getContext());
+  componentBuilder.setInsertionPoint(wiresOp);
+
+  // Create the appropriate Calyx library operation based on the arith operation
+  // type
+  Operation *libOp = componentBuilder.create<TargetType>(
+      loc, componentBuilder.getStringAttr(symName), resultTypes);
+
+  // Get the ports of the library operation using proper accessors
+  Value leftPort = libOp->getResult(0);  // left input port
+  Value rightPort = libOp->getResult(1); // right input port
+  Value outPort = libOp->getResult(2);   // output port
+
+  // Create assign operations in the wires section (not in groups)
+  // Find the wires operation and create assignments inside it
+  auto &wiresBlock = wiresOp.getBodyRegion().front();
+  OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
+
+  wiresBuilder.create<calyx::AssignOp>(loc, leftPort, lhs);
+  wiresBuilder.create<calyx::AssignOp>(loc, rightPort, rhs);
+
+  // Replace the original arith operation result with the library operation
+  // output
+  rewriter.replaceOp(op, outPort);
+
+  return success();
+}
+
+// Template function implementation for pipelined binary operations
+template <typename SourceType, typename TargetType>
+LogicalResult
+ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
+    SourceType op, typename SourceType::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+
+  // Get operation location and operands
+  auto loc = op.getLoc();
+  Value lhs = adaptor.getLhs();
+  Value rhs = adaptor.getRhs();
+
+  // Get the result type width
+  auto resultType = op.getResult().getType();
+  auto intType = dyn_cast<IntegerType>(resultType);
+  if (!intType) {
+    return rewriter.notifyMatchFailure(op, "Only integer types supported");
+  }
+
+  // Width may be used later for pipelined operations
+
+  // Create a simple symbol name using the general utility function
+  std::string symName = getOpUniqueName(op);
+
+  // Create result types for pipelined operations: clk, reset, go, left, right, out, done
+  Type i1Type = rewriter.getI1Type();
+  SmallVector<Type> resultTypes = {i1Type, i1Type, i1Type, resultType, resultType, resultType, i1Type};
+
+  // Find the parent component to create library operations at the component
+  // level
+  auto componentOp = op->template getParentOfType<calyx::ComponentOp>();
+  if (!componentOp) {
+    return rewriter.notifyMatchFailure(
+        op, "Pipelined arithmetic operation not within a calyx.component");
+  }
+
+  // Create the library operation at the component level (before wires section)
+  auto wiresOp =
+      *componentOp.getBodyBlock()->template getOps<calyx::WiresOp>().begin();
+  OpBuilder componentBuilder(rewriter.getContext());
+  componentBuilder.setInsertionPoint(wiresOp);
+
+  // Create the appropriate Calyx pipelined library operation
+  Operation *libOp = componentBuilder.create<TargetType>(
+      loc, componentBuilder.getStringAttr(symName), resultTypes);
+
+  // Get the ports of the library operation (7 results: clk, reset, go, left, right, out, done)
+  Value leftPort = libOp->getResult(3);  // left input port  
+  Value rightPort = libOp->getResult(4); // right input port
+  Value outPort = libOp->getResult(5);   // output port
+  Value donePort = libOp->getResult(6);  // done signal port
+
+  // Create assign operations in the wires section
+  auto &wiresBlock = wiresOp.getBodyRegion().front();
+  OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
+
+  wiresBuilder.create<calyx::AssignOp>(loc, leftPort, lhs);
+  wiresBuilder.create<calyx::AssignOp>(loc, rightPort, rhs);
+
+  // Replace the original arith operation result with the library operation
+  // output
+  rewriter.replaceOp(op, outPort);
+
+  return success();
+}
+
+// Template function implementation for unary operations
+template <typename SourceType, typename TargetType>
+LogicalResult
+ArithUnaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
+    SourceType op, typename SourceType::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+
+  // Get operation location and operand
+  auto loc = op.getLoc();
+  Value operand = adaptor.getIn();
+
+  // Get the input and result types
+  auto inputType = operand.getType();
+  auto resultType = op.getResult().getType();
+  
+  auto inputIntType = dyn_cast<IntegerType>(inputType);
+  auto resultIntType = dyn_cast<IntegerType>(resultType);
+  if (!inputIntType || !resultIntType) {
+    return rewriter.notifyMatchFailure(op, "Only integer types supported");
+  }
+
+  // Create a simple symbol name using the general utility function
+  std::string symName = getOpUniqueName(op);
+
+  // Find the parent component to create library operations at the component level
+  auto componentOp = op->template getParentOfType<calyx::ComponentOp>();
+  if (!componentOp) {
+    return rewriter.notifyMatchFailure(
+        op, "Unary operation not within a calyx.component");
+  }
+
+  // Create the library operation at the component level (before wires section)
+  auto wiresOp =
+      *componentOp.getBodyBlock()->template getOps<calyx::WiresOp>().begin();
+  OpBuilder componentBuilder(rewriter.getContext());
+  componentBuilder.setInsertionPoint(wiresOp);
+
+  // For truncation (SliceLibOp), we need input, output types and slice parameters
+  if constexpr (std::is_same_v<TargetType, calyx::SliceLibOp>) {
+    // SliceLibOp parameters: input width, output width
+    SmallVector<Type> resultTypes = {inputType, resultType};
+    
+    // Create slice operation with parameters
+    auto sliceOp = componentBuilder.create<TargetType>(
+        loc, componentBuilder.getStringAttr(symName), resultTypes);
+    
+    // Get the ports of the library operation
+    Value inputPort = sliceOp->getResult(0);  // input port
+    Value outPort = sliceOp->getResult(1);    // output port
+
+    // Create assign operations in the wires section
+    auto &wiresBlock = wiresOp.getBodyRegion().front();
+    OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
+
+    wiresBuilder.create<calyx::AssignOp>(loc, inputPort, operand);
+
+    // Replace the original operation result with the library operation output
+    rewriter.replaceOp(op, outPort);
+  } else {
+    // For other unary operations like ExtSI
+    SmallVector<Type> resultTypes = {inputType, resultType};
+    
+    Operation *libOp = componentBuilder.create<TargetType>(
+        loc, componentBuilder.getStringAttr(symName), resultTypes);
+
+    // Get the ports of the library operation
+    Value inputPort = libOp->getResult(0);  // input port
+    Value outPort = libOp->getResult(1);    // output port
+
+    // Create assign operations in the wires section
+    auto &wiresBlock = wiresOp.getBodyRegion().front();
+    OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
+
+    wiresBuilder.create<calyx::AssignOp>(loc, inputPort, operand);
+
+    // Replace the original operation result with the library operation output
+    rewriter.replaceOp(op, outPort);
+  }
+
+  return success();
+}
+
+// Template function implementation for comparison operations
+template <typename SourceType, typename TargetType>
+LogicalResult
+ArithComparisonOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
+    SourceType op, typename SourceType::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  // Default implementation for comparison operations
+  // TODO: Create equivalent Calyx comparison with adaptor.getLhs(),
+  // adaptor.getRhs(), and op.getPredicate() Example conversion pattern:
+  // 1. Get operation location, operands, and predicate
+  // 2. Create appropriate Calyx comparison operation
+  // 3. Replace the original operation with the Calyx operation
+
+  return success();
+}
+
+// Template function implementation for special operations
+template <typename OpType>
+LogicalResult ArithSpecialOpToCalyxPattern<OpType>::matchAndRewrite(
+    OpType op, typename OpType::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+
+  // Handle arith.constant operations
+  if (isa<mlir::arith::ConstantOp>(op)) {
+    auto constOp = cast<mlir::arith::ConstantOp>(op);
+    auto loc = op.getLoc();
+    auto value = constOp.getValue();
+    auto type = constOp.getType();
+
+    // Find the parent component to create constant at the component level
+    auto componentOp = op->template getParentOfType<calyx::ComponentOp>();
+    if (!componentOp) {
+      return rewriter.notifyMatchFailure(
+          op, "Constant operation not within a calyx.component");
+    }
+
+    // Create the constant at the component level (before wires section)
+    auto wiresOp =
+        *componentOp.getBodyBlock()->template getOps<calyx::WiresOp>().begin();
+    OpBuilder componentBuilder(rewriter.getContext());
+    componentBuilder.setInsertionPoint(wiresOp);
+
+    // Handle constants following the same pattern as SCFToCalyx
+    if (auto intAttr = dyn_cast<IntegerAttr>(value)) {
+      // Integer constants use hw::ConstantOp (as per SCFToCalyx)
+      // Use getOrCreateConstant utility to deduplicate constants
+      
+      // Handle bit width calculation - index types should have been converted to i32
+      unsigned bitWidth;
+      if (intAttr.getType().isIndex()) {
+        // Index types are converted to i32 by the index conversion pass
+        bitWidth = 32;
+      } else {
+        bitWidth = intAttr.getType().getIntOrFloatBitWidth();
+      }
+      
+      auto constantValue = getOrCreateConstant(componentOp.getOperation(), rewriter, intAttr.getInt(), bitWidth);
+      rewriter.replaceOp(op, constantValue);
+      return success();
+    } else if (auto floatAttr = dyn_cast<FloatAttr>(value)) {
+      // Floating point constants use calyx::ConstantOp (as per SCFToCalyx)
+      std::string constName = getOpUniqueName(op);
+      auto calyxConst = componentBuilder.create<calyx::ConstantOp>(
+          loc, componentBuilder.getStringAttr(constName), floatAttr, type);
+      rewriter.replaceOp(op, calyxConst.getOut());
+      return success();
+    } else {
+      return rewriter.notifyMatchFailure(
+          op, "Unsupported constant type - only integer and float constants "
+              "supported");
+    }
+  }
+
+  // Handle other special operations like select
+  if (isa<mlir::arith::SelectOp>(op)) {
+    // TODO: Implement select operation conversion
+    return rewriter.notifyMatchFailure(op,
+                                       "Select operation not yet implemented");
+  }
+
+  return rewriter.notifyMatchFailure(
+      op, "Unsupported special arithmetic operation");
+}
+
+// Explicit template instantiations for binary integer arithmetic operations
+// (non-pipelined)
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::AddIOp,
+                                            calyx::AddLibOp>;
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::SubIOp,
+                                            calyx::SubLibOp>;
+
+// Explicit template instantiations for pipelined binary integer arithmetic
+// operations
+template struct ArithPipelinedBinaryOpToCalyxPattern<mlir::arith::MulIOp,
+                                                     calyx::MultPipeLibOp>;
+template struct ArithPipelinedBinaryOpToCalyxPattern<mlir::arith::DivSIOp,
+                                                     calyx::DivSPipeLibOp>;
+template struct ArithPipelinedBinaryOpToCalyxPattern<mlir::arith::DivUIOp,
+                                                     calyx::DivUPipeLibOp>;
+template struct ArithPipelinedBinaryOpToCalyxPattern<mlir::arith::RemSIOp,
+                                                     calyx::RemSPipeLibOp>;
+template struct ArithPipelinedBinaryOpToCalyxPattern<mlir::arith::RemUIOp,
+                                                     calyx::RemUPipeLibOp>;
+// template struct ArithBinaryOpToCalyxPattern<mlir::arith::CeilDivSIOp,
+//                                             calyx::CeilDivSPipeLibOp>;
+// template struct ArithBinaryOpToCalyxPattern<mlir::arith::FloorDivSIOp,
+//                                             calyx::FloorDivSPipeLibOp>;
+
+// Explicit template instantiations for binary bitwise operations
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::AndIOp,
+                                            calyx::AndLibOp>;
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::OrIOp, calyx::OrLibOp>;
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::XOrIOp,
+                                            calyx::XorLibOp>;
+// template struct ArithBinaryOpToCalyxPattern<mlir::arith::ShLIOp,
+//                                             calyx::ShruLibOp>;
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::ShRSIOp,
+                                            calyx::SrshLibOp>;
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::ShRUIOp,
+                                            calyx::ShruLibOp>;
+
+// Explicit template instantiations for binary floating-point operations
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::AddFOp,
+                                            calyx::AddFOpIEEE754>;
+// template struct ArithBinaryOpToCalyxPattern<mlir::arith::SubFOp,
+// calyx::SubFOpIEEE754>;
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::MulFOp,
+                                            calyx::MulFOpIEEE754>;
+// template struct ArithBinaryOpToCalyxPattern<mlir::arith::DivFOp,
+// calyx::Dive>;
+
+// Explicit template instantiations for unary type conversion operations
+template struct ArithUnaryOpToCalyxPattern<mlir::arith::ExtSIOp,
+                                           calyx::ExtSILibOp>;
+template struct ArithUnaryOpToCalyxPattern<mlir::arith::TruncIOp,
+                                           calyx::SliceLibOp>;
+// Note: Incomplete unary operations - commented out until proper Calyx target
+// types are available template struct
+// ArithUnaryOpToCalyxPattern<mlir::arith::ExtUIOp, calyx::ExtUILibOp>; template
+// struct ArithUnaryOpToCalyxPattern<mlir::arith::TruncIOp, calyx::TruncLibOp>;
+// template struct ArithUnaryOpToCalyxPattern<mlir::arith::IndexCastOp,
+// calyx::IndexCastLibOp>; template struct
+// ArithUnaryOpToCalyxPattern<mlir::arith::BitcastOp, calyx::BitcastLibOp>;
+
+// Explicit template instantiations for comparison operations
+template struct ArithComparisonOpToCalyxPattern<mlir::arith::CmpIOp,
+                                                calyx::EqLibOp>;
+// template struct ArithComparisonOpToCalyxPattern<mlir::arith::CmpFOp,
+// calyx::CompareFOpIEEE754>;
+
+// Explicit template instantiations for special operations
+template struct ArithSpecialOpToCalyxPattern<mlir::arith::ConstantOp>;
+template struct ArithSpecialOpToCalyxPattern<mlir::arith::SelectOp>;
+
+} // namespace lowertocalyx
+} // namespace circt

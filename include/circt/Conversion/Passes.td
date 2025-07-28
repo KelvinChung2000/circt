@@ -212,6 +212,32 @@ def LoopScheduleToCalyx : Pass<"lower-loopschedule-to-calyx", "mlir::ModuleOp"> 
 }
 
 //===----------------------------------------------------------------------===//
+// LowerToCalyx
+//===----------------------------------------------------------------------===//
+
+def LowerToCalyx : Pass<"lower-to-calyx", "mlir::ModuleOp"> {
+  let summary = "Lower SCF and LoopSchedule to Calyx";
+  let description = [{
+    This pass lowers both SCF and LoopSchedule dialects to Calyx.
+    It unifies the functionality of SCFToCalyx and LoopScheduleToCalyx passes.
+  }];
+  let constructor = "circt::createLowerToCalyxPass()";
+  let dependentDialects = [
+    "calyx::CalyxDialect", "::mlir::scf::SCFDialect", "loopschedule::LoopScheduleDialect",
+    "hw::HWDialect", "comb::CombDialect"
+  ];
+  let options = [
+    Option<"topLevelFunctionOpt", "top-level-function", "std::string", "",
+            "Identifier of top-level function to be the entry-point component"
+            " of the Calyx program.">,
+    Option<"ciderSourceLocationMetadata", "cider-source-location-metadata", "bool", "",
+            "Whether to track source location for the Cider debugger.">,
+    Option<"writeJsonOpt", "write-json", "std::string", "",
+            "Whether to write memory contents to the json file.">
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // PipelineToHW
 //===----------------------------------------------------------------------===//
 

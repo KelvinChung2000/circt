@@ -15,6 +15,7 @@
 #include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Support/LLVM.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -528,8 +529,23 @@ FuncOpPartialLoweringPattern::partiallyLower(mlir::func::FuncOp funcOp,
     componentLoweringState =
         calyxLoweringState.getState<ComponentLoweringStateInterface>(
             componentOp);
+  } else {
+    // If no component was created for this function, skip processing
+    // unless the pattern specifically requests to process all functions
+    if (!shouldProcessAllFunctions()) {
+      return success();
+    }
   }
 
+  // Apply top-level function filtering only if the pattern explicitly requests it
+  if (shouldOnlyProcessTopLevelFunction()) {
+    StringRef topLevelFunction = calyxLoweringState.getTopLevelFunction();
+    if (funcOp.getSymName() != topLevelFunction) {
+      // Skip functions that are not the top-level function
+      return success();
+    }
+  }
+  
   return partiallyLowerFuncToComp(funcOp, rewriter);
 }
 
@@ -975,8 +991,31 @@ PredicateInfo getPredicateInfo(CmpFPredicate pred) {
 
 bool parentIsSeqCell(const Value value) {
   if (Operation *defOp = value.getDefiningOp()) {
+    // Check if the defining operation is a sequential cell
     auto cellOp = dyn_cast_or_null<calyx::CellInterface>(defOp);
-    return cellOp && !cellOp.isCombinational();
+    if (cellOp && !cellOp.isCombinational())
+      return true;
+    
+    // Check if this is a memory read data port (always sequential)
+    if (auto memOp = dyn_cast_or_null<calyx::SeqMemoryOp>(defOp)) {
+      // Any result from a sequential memory is sequential
+      return true;
+    }
+    
+    // Check if this is a register output (always sequential)  
+    if (isa<calyx::RegisterOp>(defOp)) {
+      return true;
+    }
+    
+    // Check if this is a memref load operation (sequential)
+    if (isa<memref::LoadOp>(defOp)) {
+      return true;
+    }
+    
+    // Check if this is an affine load operation (sequential) 
+    if (isa<affine::AffineLoadOp>(defOp)) {
+      return true;
+    }
   }
   return false;
 }
