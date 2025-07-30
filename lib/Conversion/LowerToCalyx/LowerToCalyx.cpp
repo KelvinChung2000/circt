@@ -150,13 +150,15 @@ void LowerToCalyxPass::runOnOperation() {
     return;
   }
 
-  // Step 4: Convert arith operations to equivalent std ops (patterns) 
-  if (failed(applyArithPatterns(moduleOp))) {
+  // Step 4: Convert memref operations BEFORE arithmetic (to establish proper
+  // value dependencies)
+  if (failed(applyMemoryPatterns(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  if (failed(applyMemoryPatterns(moduleOp))) {
+  // Step 5: Convert arith operations to equivalent std ops (patterns)
+  if (failed(applyArithPatterns(moduleOp))) {
     signalPassFailure();
     return;
   }
@@ -403,39 +405,34 @@ LogicalResult LowerToCalyxPass::applyMemoryPatterns(ModuleOp moduleOp) {
   target
       .addLegalDialect<calyx::CalyxDialect, comb::CombDialect, hw::HWDialect>();
 
-  // Mark alloca/malloc-based memref operations as illegal 
+  // Mark alloca/malloc-based memref operations as illegal
   target.addIllegalOp<mlir::memref::AllocOp, mlir::memref::AllocaOp>();
-  
-  // Mark memref operations using function arguments as illegal only after function conversion
-  target.addDynamicallyLegalOp<mlir::memref::LoadOp>([](mlir::memref::LoadOp loadOp) {
-    Value memref = loadOp.getMemref();
-    // Illegal if memref comes from alloca/malloc OR if it's in a component (after function conversion)
-    if (auto definingOp = memref.getDefiningOp()) {
-      return !isa<mlir::memref::AllocOp, mlir::memref::AllocaOp>(definingOp);
-    }
-    // If it's a block argument, check if we're in a component (function conversion done)
-    if (isa<BlockArgument>(memref)) {
-      auto parentOp = memref.getParentBlock()->getParentOp();
-      // Illegal if in component (function conversion complete), legal if still in function
-      return isa<mlir::func::FuncOp>(parentOp);
-    }
-    return true;
-  });
-  
-  target.addDynamicallyLegalOp<mlir::memref::StoreOp>([](mlir::memref::StoreOp storeOp) {
-    Value memref = storeOp.getMemref();
-    // Illegal if memref comes from alloca/malloc OR if it's in a component (after function conversion)
-    if (auto definingOp = memref.getDefiningOp()) {
-      return !isa<mlir::memref::AllocOp, mlir::memref::AllocaOp>(definingOp);
-    }
-    // If it's a block argument, check if we're in a component (function conversion done)
-    if (isa<BlockArgument>(memref)) {
-      auto parentOp = memref.getParentBlock()->getParentOp();
-      // Illegal if in component (function conversion complete), legal if still in function
-      return isa<mlir::func::FuncOp>(parentOp);
-    }
-    return true;
-  });
+
+  // Mark memref operations as illegal when in component context (after function
+  // conversion)
+  target.addDynamicallyLegalOp<mlir::memref::LoadOp>(
+      [](mlir::memref::LoadOp loadOp) {
+        // Check if we're in a component context (after function conversion)
+        if (loadOp->getParentOfType<calyx::ComponentOp>()) {
+          return false; // Illegal if in component
+        }
+        if (loadOp->getParentOfType<mlir::func::FuncOp>()) {
+          return true; // Legal if still in function
+        }
+        return true;
+      });
+
+  target.addDynamicallyLegalOp<mlir::memref::StoreOp>(
+      [](mlir::memref::StoreOp storeOp) {
+        // Check if we're in a component context (after function conversion)
+        if (storeOp->getParentOfType<calyx::ComponentOp>()) {
+          return false; // Illegal if in component
+        }
+        if (storeOp->getParentOfType<mlir::func::FuncOp>()) {
+          return true; // Legal if still in function
+        }
+        return true;
+      });
 
   RewritePatternSet patterns(&getContext());
 
@@ -495,18 +492,22 @@ LowerToCalyxPass::applyIndexConversionPatterns(ModuleOp moduleOp) {
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 
-LogicalResult LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
+LogicalResult
+LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
   ConversionTarget target(getContext());
   target.addLegalDialect<calyx::CalyxDialect>();
-  target.addLegalDialect<arith::ArithDialect, comb::CombDialect, hw::HWDialect>();
-  
-  // Allow memref operations during function conversion - they'll be converted later
+  target
+      .addLegalDialect<arith::ArithDialect, comb::CombDialect, hw::HWDialect>();
+
+  // Allow memref operations during function conversion - they'll be converted
+  // later
   target.addLegalDialect<mlir::memref::MemRefDialect>();
 
   // Mark function operations as illegal
   target.addIllegalOp<mlir::func::FuncOp, mlir::func::ReturnOp>();
 
-  // Set up type converter with complete type conversion including memref removal
+  // Set up type converter with complete type conversion including memref
+  // removal
   TypeConverter typeConverter;
   typeConverter.addConversion([](Type type) -> Type {
     if (type.isIndex()) {
