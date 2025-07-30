@@ -161,16 +161,9 @@ struct FuncCallToCalyxPattern : mlir::OpConversionPattern<mlir::func::CallOp> {
                   mlir::ConversionPatternRewriter &rewriter) const override;
 };
 
-struct FuncReturnToCalyxPattern
-    : mlir::OpConversionPattern<mlir::func::ReturnOp> {
-  using mlir::OpConversionPattern<mlir::func::ReturnOp>::OpConversionPattern;
-  mlir::LogicalResult
-  matchAndRewrite(mlir::func::ReturnOp op, mlir::func::ReturnOpAdaptor adaptor,
-                  mlir::ConversionPatternRewriter &rewriter) const override;
-};
-
 // Complete function to component conversion pattern (final step)
-struct CompleteFuncToComponentPattern : mlir::OpConversionPattern<mlir::func::FuncOp> {
+struct CompleteFuncToComponentPattern
+    : mlir::OpConversionPattern<mlir::func::FuncOp> {
   using mlir::OpConversionPattern<mlir::func::FuncOp>::OpConversionPattern;
   mlir::LogicalResult
   matchAndRewrite(mlir::func::FuncOp op, mlir::func::FuncOpAdaptor adaptor,
@@ -262,11 +255,11 @@ public:
 };
 
 // Index type conversion patterns
-/// Function signature index conversion pattern  
+/// Function signature index conversion pattern
 class FuncOpIndexConversionPattern : public OpConversionPattern<func::FuncOp> {
 public:
   using OpConversionPattern<func::FuncOp>::OpConversionPattern;
-  
+
   LogicalResult
   matchAndRewrite(func::FuncOp funcOp, func::FuncOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
@@ -274,22 +267,26 @@ public:
 
 // Control flow wrapping patterns
 /// Control flow wrapping pattern to wrap standalone enable operations
-class ControlFlowWrappingPattern : public OpConversionPattern<calyx::ControlOp> {
+class ControlFlowWrappingPattern
+    : public OpConversionPattern<calyx::ControlOp> {
 public:
   using OpConversionPattern<calyx::ControlOp>::OpConversionPattern;
-  
+
   LogicalResult
   matchAndRewrite(calyx::ControlOp controlOp, calyx::ControlOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
 };
 
-/// Pattern to remove empty groups (those with only done signals) and their enables
-class EmptyGroupOptimizationPattern : public OpConversionPattern<calyx::ComponentOp> {
+/// Pattern to remove empty groups (those with only done signals) and their
+/// enables
+class EmptyGroupOptimizationPattern
+    : public OpConversionPattern<calyx::ComponentOp> {
 public:
   using OpConversionPattern<calyx::ComponentOp>::OpConversionPattern;
-  
+
   LogicalResult
-  matchAndRewrite(calyx::ComponentOp componentOp, calyx::ComponentOp::Adaptor adaptor,
+  matchAndRewrite(calyx::ComponentOp componentOp,
+                  calyx::ComponentOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
 };
 

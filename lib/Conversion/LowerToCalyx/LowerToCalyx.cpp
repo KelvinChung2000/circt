@@ -130,22 +130,8 @@ void LowerToCalyxPass::runOnOperation() {
       return;
     }
   }
-
-  // Step 2: Convert blocks to calyx groups (for all functions)
-  for (auto funcOp : moduleOp.getOps<mlir::func::FuncOp>()) {
-    if (shouldProcessFunction(funcOp)) {
-      // Run block-to-groups for all functions
-      // The block-to-groups phase handles both simple and SCF control flow
-      // cases
-      if (failed(convertBlocksToGroups(funcOp))) {
-        signalPassFailure();
-        return;
-      }
-    }
-  }
-
-  // Step 3: Convert function to component (patterns) - After scaffolding
-  if (failed(applyCompleteFunctionConversion(moduleOp))) {
+  // Step 5: Convert arith operations to equivalent std ops (patterns)
+  if (failed(applyArithPatterns(moduleOp))) {
     signalPassFailure();
     return;
   }
@@ -157,28 +143,41 @@ void LowerToCalyxPass::runOnOperation() {
     return;
   }
 
-  // Step 5: Convert arith operations to equivalent std ops (patterns)
-  if (failed(applyArithPatterns(moduleOp))) {
+  // Step 3: Convert function to component (patterns) - After scaffolding
+  if (failed(applyCompleteFunctionConversion(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 6: Apply empty group optimization first, then control flow wrapping
-  if (failed(applyEmptyGroupOptimization(moduleOp))) {
-    signalPassFailure();
-    return;
-  }
+  // // Step 2: Convert blocks to calyx groups (for all functions)
+  // for (auto funcOp : moduleOp.getOps<mlir::func::FuncOp>()) {
+  //   if (shouldProcessFunction(funcOp)) {
+  //     // Run block-to-groups for all functions
+  //     // The block-to-groups phase handles both simple and SCF control flow
+  //     // cases
+  //     if (failed(convertBlocksToGroups(funcOp))) {
+  //       signalPassFailure();
+  //       return;
+  //     }
+  //   }
+  // }
 
-  if (failed(applyControlFlowWrapping(moduleOp))) {
-    signalPassFailure();
-    return;
-  }
+  // // Step 6: Apply empty group optimization first, then control flow wrapping
+  // if (failed(applyEmptyGroupOptimization(moduleOp))) {
+  //   signalPassFailure();
+  //   return;
+  // }
 
-  // Step 8a: Connect clock and reset signals to appropriate ports
-  if (failed(applyClockResetConnections(moduleOp))) {
-    signalPassFailure();
-    return;
-  }
+  // if (failed(applyControlFlowWrapping(moduleOp))) {
+  //   signalPassFailure();
+  //   return;
+  // }
+
+  // // Step 8a: Connect clock and reset signals to appropriate ports
+  // if (failed(applyClockResetConnections(moduleOp))) {
+  //   signalPassFailure();
+  //   return;
+  // }
 
   // Step 8b: Validation
   // if (failed(validateConversion(moduleOp))) {
@@ -194,7 +193,6 @@ LowerToCalyxPass::scaffoldCalyxStructure(mlir::func::FuncOp funcOp) {
   // Get function information before conversion
   std::string componentName = funcOp.getName().str();
   auto loc = funcOp.getLoc();
-
   // Save the original blocks before creating new structure
   auto &funcBlocks = funcOp.getBlocks();
   llvm::SmallVector<Block *> originalBlocks;
@@ -369,13 +367,7 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
   ConversionTarget target(getContext());
   target.addLegalDialect<calyx::CalyxDialect, hw::HWDialect>();
 
-  // Mark arith operations as illegal
-  target.addIllegalOp<
-      mlir::arith::AddIOp, mlir::arith::SubIOp, mlir::arith::MulIOp,
-      mlir::arith::AndIOp, mlir::arith::OrIOp, mlir::arith::XOrIOp,
-      mlir::arith::CmpIOp, mlir::arith::ConstantOp, mlir::arith::ExtSIOp,
-      mlir::arith::ExtUIOp, mlir::arith::TruncIOp, mlir::arith::SelectOp>();
-
+  target.addIllegalDialect<arith::ArithDialect>();
   RewritePatternSet patterns(&getContext());
 
   // Set up type converter
@@ -504,7 +496,9 @@ LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
   target.addLegalDialect<mlir::memref::MemRefDialect>();
 
   // Mark function operations as illegal
-  target.addIllegalOp<mlir::func::FuncOp, mlir::func::ReturnOp>();
+  target.addIllegalOp<mlir::func::FuncOp>();
+  // Keep func.return legal for now - will be handled in a later pass
+  target.addLegalOp<mlir::func::ReturnOp>();
 
   // Set up type converter with complete type conversion including memref
   // removal
@@ -520,9 +514,8 @@ LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
 
   RewritePatternSet patterns(&getContext());
   // Add complete function conversion pattern
-  patterns.add<lowertocalyx::CompleteFuncToComponentPattern,
-               lowertocalyx::FuncReturnToCalyxPattern>(typeConverter,
-                                                       &getContext());
+  patterns.add<lowertocalyx::CompleteFuncToComponentPattern>(typeConverter,
+                                                             &getContext());
 
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }

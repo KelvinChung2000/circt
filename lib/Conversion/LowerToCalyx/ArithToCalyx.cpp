@@ -65,16 +65,10 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
 
   // Find the parent component to create library operations at the component
   // level
-  auto componentOp = op->template getParentOfType<calyx::ComponentOp>();
-  if (!componentOp) {
-    return rewriter.notifyMatchFailure(
-        op, "Arithmetic operation not within a calyx.component");
-  }
-
-  // Create the library operation at the component level (before wires section)
-  // Find the wires operation and insert before it
+  func::FuncOp topLevelOp = op->template getParentOfType<func::FuncOp>();
   auto wiresOp =
-      *componentOp.getBodyBlock()->template getOps<calyx::WiresOp>().begin();
+      *topLevelOp.getFunctionBody().template getOps<calyx::WiresOp>().begin();
+
   OpBuilder componentBuilder(rewriter.getContext());
   componentBuilder.setInsertionPoint(wiresOp);
 
@@ -138,17 +132,10 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   SmallVector<Type> resultTypes = {i1Type,     i1Type,     i1Type, resultType,
                                    resultType, resultType, i1Type};
 
-  // Find the parent component to create library operations at the component
-  // level
-  auto componentOp = op->template getParentOfType<calyx::ComponentOp>();
-  if (!componentOp) {
-    return rewriter.notifyMatchFailure(
-        op, "Pipelined arithmetic operation not within a calyx.component");
-  }
-
-  // Create the library operation at the component level (before wires section)
+  auto topLevelOp = op->template getParentOfType<func::FuncOp>();
   auto wiresOp =
-      *componentOp.getBodyBlock()->template getOps<calyx::WiresOp>().begin();
+      *topLevelOp.getFunctionBody().template getOps<calyx::WiresOp>().begin();
+
   OpBuilder componentBuilder(rewriter.getContext());
   componentBuilder.setInsertionPoint(wiresOp);
 
@@ -168,6 +155,8 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
 
   wiresBuilder.create<calyx::AssignOp>(loc, leftPort, lhs);
   wiresBuilder.create<calyx::AssignOp>(loc, rightPort, rhs);
+  auto true_value = getOrCreateConstant(topLevelOp, rewriter, 1);
+  rewriter.create<calyx::AssignOp>(loc, libOp.getGo(), true_value);
 
   // Replace the original arith operation result with the library operation
   // output

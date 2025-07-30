@@ -19,21 +19,6 @@ using namespace mlir;
 namespace circt {
 namespace lowertocalyx {
 
-// Forward declarations
-static void convertMemrefLoadOp(mlir::memref::LoadOp loadOp, 
-                                ConversionPatternRewriter &rewriter,
-                                mlir::IRMapping &valueMapping,
-                                SmallVector<std::pair<size_t, MemRefType>> &memrefArgs,
-                                SmallVector<calyx::SeqMemoryOp> &memoryOps,
-                                calyx::ComponentOp componentOp);
-
-static void convertMemrefStoreOp(mlir::memref::StoreOp storeOp,
-                                 ConversionPatternRewriter &rewriter,
-                                 mlir::IRMapping &valueMapping,
-                                 SmallVector<std::pair<size_t, MemRefType>> &memrefArgs,
-                                 SmallVector<calyx::SeqMemoryOp> &memoryOps,
-                                 calyx::ComponentOp componentOp);
-
 LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
     mlir::func::FuncOp op, mlir::func::FuncOpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
@@ -42,10 +27,11 @@ LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
   if (op.isExternal()) {
     return failure();
   }
-  
+
   // Check if the function has exactly one return statement
   SmallVector<mlir::func::ReturnOp> returnOps;
-  op.walk([&](mlir::func::ReturnOp returnOp) { returnOps.push_back(returnOp); });
+  op.walk(
+      [&](mlir::func::ReturnOp returnOp) { returnOps.push_back(returnOp); });
 
   if (returnOps.size() != 1) {
     return rewriter.notifyMatchFailure(
@@ -54,19 +40,141 @@ LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
 
   auto loc = op.getLoc();
   auto funcType = op.getFunctionType();
-  
+
   // Use TypeConverter to get converted signature
   const TypeConverter *typeConverter = getTypeConverter();
   SmallVector<Type> inputTypes;
   SmallVector<Type> outputTypes;
   SmallVector<std::pair<size_t, MemRefType>> memrefArgs; // argIndex, memrefType
-  
+
+  auto wiresOp = *op.getFunctionBody().getOps<calyx::WiresOp>().begin();
+  OpBuilder componentBuilder(rewriter.getContext());
+  componentBuilder.setInsertionPoint(wiresOp);
+
   // Process input types using TypeConverter
   for (size_t i = 0; i < funcType.getInputs().size(); ++i) {
     Type inputType = funcType.getInputs()[i];
     if (auto memrefType = dyn_cast<MemRefType>(inputType)) {
       // memref arguments become internal memory - skip in component signature
       memrefArgs.push_back({i, memrefType});
+
+      if (!memrefType.hasStaticShape()) {
+        return rewriter.notifyMatchFailure(
+            op, "Dynamic memref shapes not supported");
+      }
+
+      // Calculate memory parameters
+      auto shape = memrefType.getShape();
+      int64_t elementWidth = memrefType.getElementTypeBitWidth();
+
+      // Calculate sizes and address widths for each dimension
+      SmallVector<int64_t> sizes, addrSizes;
+      for (auto dim : shape) {
+        sizes.push_back(dim);
+        addrSizes.push_back(llvm::Log2_64_Ceil(dim));
+      }
+
+      // Create memory name
+      std::string memName = "mem_arg_" + std::to_string(i);
+
+      // Create the memory operation with proper sizes and address widths
+      auto memOp = componentBuilder.create<calyx::SeqMemoryOp>(
+          loc, memName, elementWidth, sizes, addrSizes);
+
+      if (op.getArgument(i).getNumUses() == 1) {
+        auto use = op.getArgument(i).getUses().begin();
+        if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(use->getOwner())) {
+          OpBuilder loadBuilder(rewriter.getContext());
+          loadBuilder.setInsertionPointAfter(wiresOp);
+
+          // TODO: Handle type conversion for address port assignment
+          // For now, skip type conversion to get basic structure working
+          Value addrPort = memOp.addrPort(0);
+          Value indexValue = loadOp.getIndices()[0];
+
+          // Skip assignment if types don't match (will need proper conversion
+          // later)
+          if (addrPort.getType() == indexValue.getType()) {
+            loadBuilder.create<calyx::AssignOp>(loc, addrPort, indexValue);
+          }
+          // Note: Don't need to assign to loadOp.getResult() - we replace the
+          // entire operation
+          auto true_value = getOrCreateConstant(op, componentBuilder, 1);
+          loadBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
+                                              true_value);
+          loadOp.replaceAllUsesWith(memOp.readData());
+          loadOp.erase();
+
+        } else if (auto storeOp =
+                       dyn_cast<mlir::memref::StoreOp>(use->getOwner())) {
+          OpBuilder storeBuilder(rewriter.getContext());
+          storeBuilder.setInsertionPointAfter(wiresOp);
+
+          // TODO: Handle type conversion for address port assignment
+          // For now, skip type conversion to get basic structure working
+          Value addrPort = memOp.addrPort(0);
+          Value indexValue = storeOp.getIndices()[0];
+
+          // Skip assignment if types don't match (will need proper conversion
+          // later)
+          if (addrPort.getType() == indexValue.getType()) {
+            storeBuilder.create<calyx::AssignOp>(loc, addrPort, indexValue);
+          }
+          storeBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
+                                               storeOp.getValueToStore());
+          auto true_value = getOrCreateConstant(op, componentBuilder, 1);
+          storeBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
+                                               true_value);
+          storeOp.erase();
+        }
+      } else {
+        for (auto &use : op.getArgument(i).getUses()) {
+          if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(use.getOwner())) {
+            OpBuilder loadBuilder(rewriter.getContext());
+            loadBuilder.setInsertionPointAfter(loadOp);
+
+            // TODO: Handle type conversion for address port assignment
+            // For now, skip type conversion to get basic structure working
+            Value addrPort = memOp.addrPort(0);
+            Value indexValue = loadOp.getIndices()[0];
+
+            // Skip assignment if types don't match (will need proper conversion
+            // later)
+            if (addrPort.getType() == indexValue.getType()) {
+              loadBuilder.create<calyx::AssignOp>(loc, addrPort, indexValue);
+            }
+            // Note: Don't need to assign to loadOp.getResult() - we replace the
+            // entire operation
+            auto true_value = getOrCreateConstant(op, rewriter, 1);
+            loadBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
+                                                true_value);
+            loadOp.replaceAllUsesWith(memOp.readData());
+            loadOp.erase();
+
+          } else if (auto storeOp =
+                         dyn_cast<mlir::memref::StoreOp>(use.getOwner())) {
+            OpBuilder storeBuilder(rewriter.getContext());
+            storeBuilder.setInsertionPointAfter(storeOp);
+
+            // TODO: Handle type conversion for address port assignment
+            // For now, skip type conversion to get basic structure working
+            Value addrPort = memOp.addrPort(0);
+            Value indexValue = storeOp.getIndices()[0];
+
+            // Skip assignment if types don't match (will need proper conversion
+            // later)
+            if (addrPort.getType() == indexValue.getType()) {
+              storeBuilder.create<calyx::AssignOp>(loc, addrPort, indexValue);
+            }
+            storeBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
+                                                 storeOp.getValueToStore());
+            auto true_value = getOrCreateConstant(op, rewriter, 1);
+            storeBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
+                                                 true_value);
+            storeOp.erase();
+          }
+        }
+      }
     } else {
       // Use TypeConverter for other types
       Type convertedType = typeConverter->convertType(inputType);
@@ -75,7 +183,7 @@ LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
       }
     }
   }
-  
+
   // Process output types using TypeConverter
   for (Type outputType : funcType.getResults()) {
     Type convertedType = typeConverter->convertType(outputType);
@@ -99,10 +207,12 @@ LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
       }
     }
     if (!isMemref) {
-      ports.push_back({rewriter.getStringAttr("arg" + std::to_string(portIndex)),
-                       inputTypes[portIndex], calyx::Direction::Input,
-                       DictionaryAttr::get(rewriter.getContext())});
+      ports.push_back(
+          {rewriter.getStringAttr("arg" + std::to_string(portIndex)),
+           inputTypes[portIndex], calyx::Direction::Input,
+           DictionaryAttr::get(rewriter.getContext())});
       portIndex++;
+    } else {
     }
   }
 
@@ -120,62 +230,11 @@ LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
   auto componentOp = rewriter.create<calyx::ComponentOp>(
       loc, rewriter.getStringAttr(op.getName()), ports);
 
-  // Create internal memory operations for memref arguments
-  SmallVector<calyx::SeqMemoryOp> memoryOps;
-  rewriter.setInsertionPoint(componentOp.getWiresOp());
-  
-  for (auto &memrefArg : memrefArgs) {
-    size_t argIndex = memrefArg.first;
-    MemRefType memrefType = memrefArg.second;
-    
-    if (!memrefType.hasStaticShape()) {
-      return rewriter.notifyMatchFailure(op, "Dynamic memref shapes not supported");
-    }
-    
-    // Calculate memory parameters
-    auto shape = memrefType.getShape();
-    int64_t elementWidth = memrefType.getElementTypeBitWidth();
-    
-    // Calculate sizes and address widths for each dimension
-    SmallVector<int64_t> sizes, addrSizes;
-    for (auto dim : shape) {
-      sizes.push_back(dim);
-      addrSizes.push_back(llvm::Log2_64_Ceil(dim));
-    }
-    
-    // Create memory name
-    std::string memName = "mem_arg_" + std::to_string(argIndex);
-    
-    // Create the memory operation with proper sizes and address widths
-    auto memOp = rewriter.create<calyx::SeqMemoryOp>(
-        loc, memName, elementWidth, sizes, addrSizes);
-    memoryOps.push_back(memOp);
-  }
-
-  // Pre-process all memref operations in the function to convert them first
-  // This prevents null reference issues when cloning operations
-  SmallVector<mlir::memref::LoadOp> allLoadOps;
-  SmallVector<mlir::memref::StoreOp> allStoreOps;
-  
-  op.walk([&](mlir::memref::LoadOp loadOp) {
-    allLoadOps.push_back(loadOp);
-  });
-  op.walk([&](mlir::memref::StoreOp storeOp) {
-    allStoreOps.push_back(storeOp);
-  });
-
-  // Create value mapping between function arguments and component arguments
-  mlir::IRMapping valueMapping;
-  auto funcArgs = op.getArguments();
-  auto componentArgs = componentOp.getArguments();
-  
-  // Map function arguments to component arguments and memory operations
-  // Component arguments order: input ports (non-memref), output ports, clk, reset, go, done
-  size_t componentArgIndex = 0;
-  size_t memoryIndex = 0;
-  
-  for (size_t i = 0; i < funcArgs.size(); ++i) {
-    // Check if this argument is a memref
+  // Clone the body of the FuncOp into the ComponentOp
+  IRMapping mapping;
+  // Map function arguments to component input ports (excluding memrefs)
+  size_t inputPortIdx = 0;
+  for (size_t i = 0; i < op.getNumArguments(); ++i) {
     bool isMemref = false;
     for (auto &memrefArg : memrefArgs) {
       if (memrefArg.first == i) {
@@ -183,312 +242,63 @@ LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
         break;
       }
     }
-    
-    if (isMemref) {
-      // Create a temporary block argument with the correct memref type to avoid null references
-      // This placeholder will prevent null operands during cloning
-      Block *tempBlock = new Block();
-      Value placeholder = tempBlock->addArgument(funcArgs[i].getType(), funcArgs[i].getLoc());
-      valueMapping.map(funcArgs[i], placeholder);
-      memoryIndex++;
-    } else {
-      // Map regular arguments to component ports
-      if (componentArgIndex < componentArgs.size()) {
-        valueMapping.map(funcArgs[i], componentArgs[componentArgIndex]);
-        componentArgIndex++;
-      }
+    if (!isMemref) {
+      mapping.map(op.getArgument(i), componentOp.getArgument(inputPortIdx));
+      inputPortIdx++;
     }
+    // Memref arguments are handled separately (not mapped to ports)
   }
 
-  // Pre-map memref load results to memory read data to avoid null references
-  for (auto loadOp : allLoadOps) {
-    Value memref = loadOp.getMemref();
-    if (auto blockArg = dyn_cast<BlockArgument>(memref)) {
-      size_t argIndex = blockArg.getArgNumber();
-      // Find the corresponding memory operation
-      for (size_t i = 0; i < memrefArgs.size(); ++i) {
-        if (memrefArgs[i].first == argIndex && i < memoryOps.size()) {
-          // Pre-map the load result to the memory read data
-          Value readData = memoryOps[i].readData();
-          valueMapping.map(loadOp.getResult(), readData);
-          // Successfully pre-mapped load result
-          break;
-        }
-      }
-    }
-  }
-
-  // Find the scaffolded wires and control operations in the function
-  auto &funcBlock = op.getBody().front();
-  calyx::WiresOp funcWiresOp = nullptr;
-  calyx::ControlOp funcControlOp = nullptr;
-  SmallVector<Operation *> otherOpsToMove;
-
-  for (Operation &bodyOp : funcBlock.getOperations()) {
-    if (auto wiresOp = dyn_cast<calyx::WiresOp>(bodyOp)) {
-      funcWiresOp = wiresOp;
-    } else if (auto controlOp = dyn_cast<calyx::ControlOp>(bodyOp)) {
-      funcControlOp = controlOp;
-    } else if (!isa<mlir::func::ReturnOp>(bodyOp)) {
-      otherOpsToMove.push_back(&bodyOp);
-    }
-  }
-
-  // Get the component's wires and control operations
+  // Get the auto-generated empty wires and control ops from the component
   auto componentWiresOp = componentOp.getWiresOp();
   auto componentControlOp = componentOp.getControlOp();
+  Block *componentWiresBlock =
+      componentWiresOp ? componentWiresOp.getBodyBlock() : nullptr;
+  Block *componentControlBlock =
+      componentControlOp ? componentControlOp.getBodyBlock() : nullptr;
 
-  // Clone other operations (registers, constants) to component body with value mapping
-  rewriter.setInsertionPoint(componentWiresOp);
-  for (Operation *op : otherOpsToMove) {
-    // Skip memref operations as they're already converted
-    if (!isa<mlir::memref::LoadOp, mlir::memref::StoreOp>(op)) {
-      rewriter.clone(*op, valueMapping);
-    }
-  }
+  // Move all operations from the scaffolded function, organizing them properly
+  Block *funcBlock = &op.getBody().front();
+  Block *componentBlock = componentOp.getBodyBlock();
 
-  // Clone content from function wires to component wires with value mapping
-  if (funcWiresOp && !funcWiresOp.getBodyRegion().empty()) {
-    auto &funcWiresBlock = funcWiresOp.getBodyRegion().front();
-    auto &componentWiresBlock = componentWiresOp.getBodyRegion().front();
-    
-    rewriter.setInsertionPointToEnd(&componentWiresBlock);
-    for (auto &op : llvm::make_early_inc_range(funcWiresBlock)) {
-      // Skip memref operations as they're already converted
-      if (!isa<mlir::memref::LoadOp, mlir::memref::StoreOp>(op)) {
-        rewriter.clone(op, valueMapping);
-      }
-    }
-  }
+  for (auto &operation : llvm::make_early_inc_range(*funcBlock)) {
+    // if (isa<mlir::func::ReturnOp>(operation)) {
+    //   continue; // Skip return operations
+    // }
 
-  // Clone content from function control to component control with value mapping
-  // and handle memref operations directly
-  if (funcControlOp && !funcControlOp.getBodyRegion().empty()) {
-    auto &funcControlBlock = funcControlOp.getBodyRegion().front();
-    auto &componentControlBlock = componentControlOp.getBodyRegion().front();
-    
-    rewriter.setInsertionPointToEnd(&componentControlBlock);
-    for (auto &op : llvm::make_early_inc_range(funcControlBlock)) {
-      if (!isa<mlir::func::ReturnOp>(op)) {
-        // Handle memref operations specially
-        if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(op)) {
-          convertMemrefLoadOp(loadOp, rewriter, valueMapping, memrefArgs, memoryOps, componentOp);
-        } else if (auto storeOp = dyn_cast<mlir::memref::StoreOp>(op)) {
-          convertMemrefStoreOp(storeOp, rewriter, valueMapping, memrefArgs, memoryOps, componentOp);
-        } else {
-          // For other operations, clone normally with value mapping
-          rewriter.clone(op, valueMapping);
+    // Clone with value mapping
+    auto *clonedOp = rewriter.clone(operation, mapping);
+
+    if (auto wiresOp = dyn_cast<calyx::WiresOp>(*clonedOp)) {
+      // Move contents of scaffolded wires into component wires, then erase the
+      // duplicate
+      if (componentWiresBlock) {
+        for (auto &innerOp : llvm::make_early_inc_range(
+                 wiresOp.getBodyBlock()->getOperations())) {
+          innerOp.moveBefore(componentWiresBlock, componentWiresBlock->begin());
         }
       }
-    }
-  }
-
-  // Handle return value connection
-  if (!outputTypes.empty()) {
-    auto &wiresBlock = componentWiresOp.getBodyRegion().front();
-    rewriter.setInsertionPointToStart(&wiresBlock);
-    OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
-
-    // Find the return operation and connect its operand to component output
-    auto returnOp = returnOps[0];
-    if (returnOp.getNumOperands() > 0) {
-      Value originalReturnValue = returnOp.getOperand(0);
-      
-      // Look up the mapped return value if it exists in our mapping
-      Value returnValue = valueMapping.lookupOrDefault(originalReturnValue);
-      
-      // If the return value wasn't mapped and comes from a memref operation,
-      // defer the output connection to be handled by memory patterns
-      if (returnValue == originalReturnValue) {
-        // Check if the return value comes from a memref operation
-        if (auto definingOp = originalReturnValue.getDefiningOp()) {
-          if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(definingOp)) {
-            // Handle memref load in return value
-            llvm::errs() << "DEBUG: Found memref.load in return value\n";
-            convertMemrefLoadOp(loadOp, rewriter, valueMapping, memrefArgs, memoryOps, componentOp);
-            // Look up the converted return value
-            Value convertedReturnValue = valueMapping.lookupOrDefault(originalReturnValue);
-            if (convertedReturnValue != originalReturnValue) {
-              // Connect component output to the converted return value
-              Value outputPort = calyx::getComponentOutput(componentOp, 0);
-              wiresBuilder.create<calyx::AssignOp>(loc, outputPort, convertedReturnValue);
-
-              // Set up done signal
-              Value doneSignal = resolveDoneSignalForValue(
-                  convertedReturnValue, loc, wiresBuilder, componentOp.getOperation());
-              updateComponentDoneConnection(componentOp, doneSignal, loc, wiresBuilder);
-            }
-          } else {
-            // Connect component output to the return value
-            Value outputPort = calyx::getComponentOutput(componentOp, 0);
-            wiresBuilder.create<calyx::AssignOp>(loc, outputPort, returnValue);
-
-            // Set up done signal
-            Value doneSignal = resolveDoneSignalForValue(
-                returnValue, loc, wiresBuilder, componentOp.getOperation());
-            updateComponentDoneConnection(componentOp, doneSignal, loc, wiresBuilder);
-          }
+      clonedOp->erase();
+    } else if (auto controlOp = dyn_cast<calyx::ControlOp>(*clonedOp)) {
+      // Move contents of scaffolded control into component control, then erase
+      // the duplicate
+      if (componentControlBlock) {
+        for (auto &innerOp : llvm::make_early_inc_range(
+                 controlOp.getBodyBlock()->getOperations())) {
+          innerOp.moveBefore(componentControlBlock,
+                             componentControlBlock->begin());
         }
-      } else {
-        // Connect component output to the return value
-        Value outputPort = calyx::getComponentOutput(componentOp, 0);
-        wiresBuilder.create<calyx::AssignOp>(loc, outputPort, returnValue);
-
-        // Set up done signal
-        Value doneSignal = resolveDoneSignalForValue(
-            returnValue, loc, wiresBuilder, componentOp.getOperation());
-        updateComponentDoneConnection(componentOp, doneSignal, loc, wiresBuilder);
       }
+      clonedOp->erase();
+    } else {
+      // Other operations (memories, constants) go at component level
+      clonedOp->moveBefore(componentBlock, componentBlock->begin());
     }
   }
 
-  // Erase all remaining memref operations in the component that weren't already erased
-  SmallVector<mlir::memref::LoadOp> remainingLoadOps;
-  SmallVector<mlir::memref::StoreOp> remainingStoreOps;
-  
-  componentOp.walk([&](mlir::memref::LoadOp loadOp) {
-    remainingLoadOps.push_back(loadOp);
-  });
-  componentOp.walk([&](mlir::memref::StoreOp storeOp) {
-    remainingStoreOps.push_back(storeOp);
-  });
-
-  // Erase remaining memref operations
-  for (auto loadOp : remainingLoadOps) {
-    rewriter.eraseOp(loadOp);
-  }
-  for (auto storeOp : remainingStoreOps) {
-    rewriter.eraseOp(storeOp);
-  }
-
-  // Replace the function operation with the component
   rewriter.replaceOp(op, componentOp);
 
   return success();
-}
-
-LogicalResult FuncReturnToCalyxPattern::matchAndRewrite(
-    mlir::func::ReturnOp op, mlir::func::ReturnOpAdaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-
-  // func.return should just be erased - the output connections
-  // should have been handled by the component conversion
-  rewriter.eraseOp(op);
-  return success();
-}
-
-// Helper function to convert memref.load operations during function conversion
-static void convertMemrefLoadOp(mlir::memref::LoadOp loadOp, 
-                                ConversionPatternRewriter &rewriter,
-                                mlir::IRMapping &valueMapping,
-                                SmallVector<std::pair<size_t, MemRefType>> &memrefArgs,
-                                SmallVector<calyx::SeqMemoryOp> &memoryOps,
-                                calyx::ComponentOp componentOp) {
-  Value memref = loadOp.getMemref();
-  auto indices = loadOp.getIndices();
-  
-  // Check if memref is mapped to a placeholder (original was a block argument)
-  // We need to find the original memref argument to determine which memory to use
-  
-  size_t argIndex = -1;
-  bool foundArgIndex = false;
-  
-  // Search through the value mapping to find the original function argument
-  for (auto &mappingEntry : valueMapping.getValueMap()) {
-    if (mappingEntry.second == memref) {
-      // This mapped value matches our memref, check if the key is a function argument
-      if (auto blockArg = dyn_cast<BlockArgument>(mappingEntry.first)) {
-        argIndex = blockArg.getArgNumber();
-        foundArgIndex = true;
-        break;
-      }
-    }
-  }
-  
-  if (foundArgIndex) {
-    
-    // Find the corresponding SeqMemoryOp
-    calyx::SeqMemoryOp memOp = nullptr;
-    for (size_t i = 0; i < memrefArgs.size(); ++i) {
-      if (memrefArgs[i].first == argIndex && i < memoryOps.size()) {
-        memOp = memoryOps[i];
-        break;
-      }
-    }
-    
-    if (memOp) {
-      // Create proper wiring for memory read operation
-      Value readData = memOp.readData();
-      
-      // Map the load result to memory read data in the value mapping
-      valueMapping.map(loadOp.getResult(), readData);
-      
-      // Create assignment to connect memory address if needed
-      if (indices.size() == 1) {
-        Value mappedIndex = valueMapping.lookupOrDefault(indices[0]);
-        Value memAddr = memOp.addrPort(0); // Get address port for dimension 0
-        
-        // Find the containing group to add the address assignment
-        auto parentGroup = loadOp->getParentOfType<calyx::GroupOp>();
-        if (parentGroup) {
-          OpBuilder groupBuilder(parentGroup.getBodyBlock(), parentGroup.getBodyBlock()->end());
-          groupBuilder.create<calyx::AssignOp>(loadOp.getLoc(), memAddr, mappedIndex);
-        }
-      }
-      
-      // Don't create the original load operation
-      return;
-    }
-  }
-  
-  // If we can't handle the memref operation, don't clone it
-  // Leave it for later passes to handle
-}
-
-// Helper function to convert memref.store operations during function conversion  
-static void convertMemrefStoreOp(mlir::memref::StoreOp storeOp,
-                                 ConversionPatternRewriter &rewriter,
-                                 mlir::IRMapping &valueMapping,
-                                 SmallVector<std::pair<size_t, MemRefType>> &memrefArgs,
-                                 SmallVector<calyx::SeqMemoryOp> &memoryOps,
-                                 calyx::ComponentOp componentOp) {
-  Value memref = storeOp.getMemref();
-  Value valueToStore = storeOp.getValueToStore();
-  auto indices = storeOp.getIndices();
-  
-  // Find which memref argument this store is using
-  if (auto blockArg = dyn_cast<BlockArgument>(memref)) {
-    size_t argIndex = blockArg.getArgNumber();
-    
-    // Find the corresponding SeqMemoryOp
-    calyx::SeqMemoryOp memOp = nullptr;
-    for (size_t i = 0; i < memrefArgs.size(); ++i) {
-      if (memrefArgs[i].first == argIndex && i < memoryOps.size()) {
-        memOp = memoryOps[i];
-        break;
-      }
-    }
-    
-    if (memOp) {
-      // Map the store operation to memory write operations
-      // For now, create simplified wiring
-      // Note: This is a simplified conversion - full implementation would need proper sequencing
-      
-      // Map value to store and addresses if needed
-      Value mappedValue = valueMapping.lookupOrDefault(valueToStore);
-      if (indices.size() == 1) {
-        Value mappedIndex = valueMapping.lookupOrDefault(indices[0]);
-        // Create assignments to connect value and address to memory write ports
-        // Note: This is simplified - full implementation would need proper wiring
-      }
-      
-      // Don't create the original store operation
-      return;
-    }
-  }
-  
-  // If we can't handle the memref operation, don't clone it
-  // Leave it for later passes to handle
 }
 
 } // namespace lowertocalyx
