@@ -46,6 +46,26 @@ public:
   }
 };
 
+template <typename ConcreteType>
+class BinaryOpTrait
+    : public mlir::OpTrait::TraitBase<ConcreteType, BinaryOpTrait> {};
+
+template <typename ConcreteType>
+class UnaryOpTrait
+    : public mlir::OpTrait::TraitBase<ConcreteType, UnaryOpTrait> {};
+
+template <typename ConcreteType>
+class SequentialTrait
+    : public mlir::OpTrait::TraitBase<ConcreteType, SequentialTrait> {};
+
+template <typename ConcreteType>
+class PipelineTrait
+    : public mlir::OpTrait::TraitBase<ConcreteType, PipelineTrait> {};
+
+template <typename ConcreteType>
+class MemoryOpTrait
+    : public mlir::OpTrait::TraitBase<ConcreteType, MemoryOpTrait> {};
+
 /// A helper function to verify a combinational operation.
 LogicalResult verifyCombinationalOp(Operation *op);
 

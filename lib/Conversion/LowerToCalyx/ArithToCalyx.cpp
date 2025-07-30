@@ -41,6 +41,9 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
     SourceType op, typename SourceType::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
 
+  static_assert(TargetType::template hasTrait<calyx::BinaryOpTrait>(),
+                "TargetType must have BinaryOpTrait");
+
   // Get operation location and operands
   auto loc = op.getLoc();
   Value lhs = adaptor.getLhs();
@@ -77,13 +80,13 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
 
   // Create the appropriate Calyx library operation based on the arith operation
   // type
-  Operation *libOp = componentBuilder.create<TargetType>(
+  TargetType libOp = componentBuilder.create<TargetType>(
       loc, componentBuilder.getStringAttr(symName), resultTypes);
 
   // Get the ports of the library operation using proper accessors
-  Value leftPort = libOp->getResult(0);  // left input port
-  Value rightPort = libOp->getResult(1); // right input port
-  Value outPort = libOp->getResult(2);   // output port
+  Value leftPort = libOp.getLeft();   // left input port
+  Value rightPort = libOp.getRight(); // right input port
+  Value outPort = libOp.getOut();     // output port
 
   // Create assign operations in the wires section (not in groups)
   // Find the wires operation and create assignments inside it
@@ -107,6 +110,11 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
     SourceType op, typename SourceType::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
 
+  static_assert(TargetType::template hasTrait<calyx::PipelineTrait>(),
+                "TargetType must have PipelineTrait");
+  static_assert(TargetType::template hasTrait<calyx::BinaryOpTrait>(),
+                "TargetType must have BinaryOpTrait");
+
   // Get operation location and operands
   auto loc = op.getLoc();
   Value lhs = adaptor.getLhs();
@@ -124,9 +132,11 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   // Create a simple symbol name using the general utility function
   std::string symName = getOpUniqueName(op);
 
-  // Create result types for pipelined operations: clk, reset, go, left, right, out, done
+  // Create result types for pipelined operations: clk, reset, go, left, right,
+  // out, done
   Type i1Type = rewriter.getI1Type();
-  SmallVector<Type> resultTypes = {i1Type, i1Type, i1Type, resultType, resultType, resultType, i1Type};
+  SmallVector<Type> resultTypes = {i1Type,     i1Type,     i1Type, resultType,
+                                   resultType, resultType, i1Type};
 
   // Find the parent component to create library operations at the component
   // level
@@ -143,14 +153,14 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   componentBuilder.setInsertionPoint(wiresOp);
 
   // Create the appropriate Calyx pipelined library operation
-  Operation *libOp = componentBuilder.create<TargetType>(
+  TargetType libOp = componentBuilder.create<TargetType>(
       loc, componentBuilder.getStringAttr(symName), resultTypes);
 
-  // Get the ports of the library operation (7 results: clk, reset, go, left, right, out, done)
-  Value leftPort = libOp->getResult(3);  // left input port  
-  Value rightPort = libOp->getResult(4); // right input port
-  Value outPort = libOp->getResult(5);   // output port
-  Value donePort = libOp->getResult(6);  // done signal port
+  // Get the ports of the library operation (7 results: clk, reset, go, left,
+  // right, out, done)
+  Value leftPort = libOp.getLeft();   // left input port
+  Value rightPort = libOp.getRight(); // right input port
+  Value outPort = libOp.getOut();     // output port
 
   // Create assign operations in the wires section
   auto &wiresBlock = wiresOp.getBodyRegion().front();
@@ -180,7 +190,7 @@ ArithUnaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   // Get the input and result types
   auto inputType = operand.getType();
   auto resultType = op.getResult().getType();
-  
+
   auto inputIntType = dyn_cast<IntegerType>(inputType);
   auto resultIntType = dyn_cast<IntegerType>(resultType);
   if (!inputIntType || !resultIntType) {
@@ -190,7 +200,8 @@ ArithUnaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   // Create a simple symbol name using the general utility function
   std::string symName = getOpUniqueName(op);
 
-  // Find the parent component to create library operations at the component level
+  // Find the parent component to create library operations at the component
+  // level
   auto componentOp = op->template getParentOfType<calyx::ComponentOp>();
   if (!componentOp) {
     return rewriter.notifyMatchFailure(
@@ -203,18 +214,19 @@ ArithUnaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   OpBuilder componentBuilder(rewriter.getContext());
   componentBuilder.setInsertionPoint(wiresOp);
 
-  // For truncation (SliceLibOp), we need input, output types and slice parameters
+  // For truncation (SliceLibOp), we need input, output types and slice
+  // parameters
   if constexpr (std::is_same_v<TargetType, calyx::SliceLibOp>) {
     // SliceLibOp parameters: input width, output width
     SmallVector<Type> resultTypes = {inputType, resultType};
-    
+
     // Create slice operation with parameters
     auto sliceOp = componentBuilder.create<TargetType>(
         loc, componentBuilder.getStringAttr(symName), resultTypes);
-    
+
     // Get the ports of the library operation
-    Value inputPort = sliceOp->getResult(0);  // input port
-    Value outPort = sliceOp->getResult(1);    // output port
+    Value inputPort = sliceOp->getResult(0); // input port
+    Value outPort = sliceOp->getResult(1);   // output port
 
     // Create assign operations in the wires section
     auto &wiresBlock = wiresOp.getBodyRegion().front();
@@ -227,13 +239,13 @@ ArithUnaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   } else {
     // For other unary operations like ExtSI
     SmallVector<Type> resultTypes = {inputType, resultType};
-    
+
     Operation *libOp = componentBuilder.create<TargetType>(
         loc, componentBuilder.getStringAttr(symName), resultTypes);
 
     // Get the ports of the library operation
-    Value inputPort = libOp->getResult(0);  // input port
-    Value outPort = libOp->getResult(1);    // output port
+    Value inputPort = libOp->getResult(0); // input port
+    Value outPort = libOp->getResult(1);   // output port
 
     // Create assign operations in the wires section
     auto &wiresBlock = wiresOp.getBodyRegion().front();
@@ -261,7 +273,7 @@ ArithComparisonOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   // 2. Create appropriate Calyx comparison operation
   // 3. Replace the original operation with the Calyx operation
 
-  return success();
+  return failure();
 }
 
 // Template function implementation for special operations
@@ -294,8 +306,9 @@ LogicalResult ArithSpecialOpToCalyxPattern<OpType>::matchAndRewrite(
     if (auto intAttr = dyn_cast<IntegerAttr>(value)) {
       // Integer constants use hw::ConstantOp (as per SCFToCalyx)
       // Use getOrCreateConstant utility to deduplicate constants
-      
-      // Handle bit width calculation - index types should have been converted to i32
+
+      // Handle bit width calculation - index types should have been converted
+      // to i32
       unsigned bitWidth;
       if (intAttr.getType().isIndex()) {
         // Index types are converted to i32 by the index conversion pass
@@ -303,8 +316,9 @@ LogicalResult ArithSpecialOpToCalyxPattern<OpType>::matchAndRewrite(
       } else {
         bitWidth = intAttr.getType().getIntOrFloatBitWidth();
       }
-      
-      auto constantValue = getOrCreateConstant(componentOp.getOperation(), rewriter, intAttr.getInt(), bitWidth);
+
+      auto constantValue = getOrCreateConstant(
+          componentOp.getOperation(), rewriter, intAttr.getInt(), bitWidth);
       rewriter.replaceOp(op, constantValue);
       return success();
     } else if (auto floatAttr = dyn_cast<FloatAttr>(value)) {

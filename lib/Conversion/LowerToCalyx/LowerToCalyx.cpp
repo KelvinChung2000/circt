@@ -85,8 +85,8 @@ private:
   /// Step 5: Apply memory patterns using the separated pattern classes
   LogicalResult applyMemoryPatterns(ModuleOp moduleOp);
 
-  /// Step 6: Apply function to component patterns
-  LogicalResult applyFunctionPatterns(ModuleOp moduleOp);
+  /// Step 6: Apply complete function to component conversion (final step)
+  LogicalResult applyCompleteFunctionConversion(ModuleOp moduleOp);
 
   /// Step 7a: Apply empty group optimization before wrapping
   LogicalResult applyEmptyGroupOptimization(ModuleOp moduleOp);
@@ -111,30 +111,8 @@ private:
 void LowerToCalyxPass::runOnOperation() {
   ModuleOp moduleOp = getOperation();
 
-  // Step 0: Convert index types to avoid hw.bitcast issues
-  // This must happen before any other processing
-  if (failed(applyIndexConversionPatterns(moduleOp))) {
-    signalPassFailure();
-    return;
-  }
-
-  // Additional manual conversion for values that patterns might miss
-  moduleOp.walk([&](Operation *op) {
-    for (Value result : op->getResults()) {
-      if (result.getType().isIndex()) {
-        result.setType(IntegerType::get(&getContext(), 32));
-      }
-    }
-  });
-
-  // Walk through all block arguments and convert index types
-  moduleOp.walk([&](Block *block) {
-    for (Value arg : block->getArguments()) {
-      if (arg.getType().isIndex()) {
-        arg.setType(IntegerType::get(&getContext(), 32));
-      }
-    }
-  });
+  // Step 0: Index conversion is now integrated into function conversion
+  // to handle type coherence properly
 
   // Step 1: Add wires section and wrap function body in control op
   // (scaffolding)
@@ -166,15 +144,13 @@ void LowerToCalyxPass::runOnOperation() {
     }
   }
 
-  // Step 3: Convert function to component (patterns) - Do this FIRST to create
-  // symbol table context
-  if (failed(applyFunctionPatterns(moduleOp))) {
+  // Step 3: Convert function to component (patterns) - After scaffolding
+  if (failed(applyCompleteFunctionConversion(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 4: Convert arith operations to equivalent std ops (patterns) - After
-  // components exist
+  // Step 4: Convert arith operations to equivalent std ops (patterns) 
   if (failed(applyArithPatterns(moduleOp))) {
     signalPassFailure();
     return;
@@ -185,7 +161,7 @@ void LowerToCalyxPass::runOnOperation() {
     return;
   }
 
-  // Step 7: Apply empty group optimization first, then control flow wrapping
+  // Step 6: Apply empty group optimization first, then control flow wrapping
   if (failed(applyEmptyGroupOptimization(moduleOp))) {
     signalPassFailure();
     return;
@@ -365,9 +341,11 @@ LowerToCalyxPass::convertBlocksToGroups(mlir::func::FuncOp funcOp) {
       // group_done
       if (groupDoneOps.empty()) {
         // Create constant at component level using deduplication helper
-        // At this point, funcOp should already be converted to a calyx.component
+        // At this point, funcOp should already be converted to a
+        // calyx.component
         OpBuilder componentBuilder(&entryBlock, entryBlock.end());
-        auto constOne = getOrCreateConstant(funcOp.getOperation(), componentBuilder, 1);
+        auto constOne =
+            getOrCreateConstant(funcOp.getOperation(), componentBuilder, 1);
 
         // Then create group_done in the group
         OpBuilder groupBuilder(groupBodyBlock, groupBodyBlock->end());
@@ -425,9 +403,39 @@ LogicalResult LowerToCalyxPass::applyMemoryPatterns(ModuleOp moduleOp) {
   target
       .addLegalDialect<calyx::CalyxDialect, comb::CombDialect, hw::HWDialect>();
 
-  // Mark memref operations as illegal - they need to be converted
-  target.addIllegalOp<mlir::memref::LoadOp, mlir::memref::StoreOp,
-                      mlir::memref::AllocOp, mlir::memref::AllocaOp>();
+  // Mark alloca/malloc-based memref operations as illegal 
+  target.addIllegalOp<mlir::memref::AllocOp, mlir::memref::AllocaOp>();
+  
+  // Mark memref operations using function arguments as illegal only after function conversion
+  target.addDynamicallyLegalOp<mlir::memref::LoadOp>([](mlir::memref::LoadOp loadOp) {
+    Value memref = loadOp.getMemref();
+    // Illegal if memref comes from alloca/malloc OR if it's in a component (after function conversion)
+    if (auto definingOp = memref.getDefiningOp()) {
+      return !isa<mlir::memref::AllocOp, mlir::memref::AllocaOp>(definingOp);
+    }
+    // If it's a block argument, check if we're in a component (function conversion done)
+    if (isa<BlockArgument>(memref)) {
+      auto parentOp = memref.getParentBlock()->getParentOp();
+      // Illegal if in component (function conversion complete), legal if still in function
+      return isa<mlir::func::FuncOp>(parentOp);
+    }
+    return true;
+  });
+  
+  target.addDynamicallyLegalOp<mlir::memref::StoreOp>([](mlir::memref::StoreOp storeOp) {
+    Value memref = storeOp.getMemref();
+    // Illegal if memref comes from alloca/malloc OR if it's in a component (after function conversion)
+    if (auto definingOp = memref.getDefiningOp()) {
+      return !isa<mlir::memref::AllocOp, mlir::memref::AllocaOp>(definingOp);
+    }
+    // If it's a block argument, check if we're in a component (function conversion done)
+    if (isa<BlockArgument>(memref)) {
+      auto parentOp = memref.getParentBlock()->getParentOp();
+      // Illegal if in component (function conversion complete), legal if still in function
+      return isa<mlir::func::FuncOp>(parentOp);
+    }
+    return true;
+  });
 
   RewritePatternSet patterns(&getContext());
 
@@ -487,22 +495,31 @@ LowerToCalyxPass::applyIndexConversionPatterns(ModuleOp moduleOp) {
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 
-LogicalResult LowerToCalyxPass::applyFunctionPatterns(ModuleOp moduleOp) {
+LogicalResult LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
   ConversionTarget target(getContext());
   target.addLegalDialect<calyx::CalyxDialect>();
-  target.addLegalDialect<arith::ArithDialect>(); // Allow arith operations in
-                                                 // the component
+  target.addLegalDialect<arith::ArithDialect, comb::CombDialect, hw::HWDialect>();
+  
+  // Allow memref operations during function conversion - they'll be converted later
+  target.addLegalDialect<mlir::memref::MemRefDialect>();
 
   // Mark function operations as illegal
   target.addIllegalOp<mlir::func::FuncOp, mlir::func::ReturnOp>();
 
-  // Set up type converter
+  // Set up type converter with complete type conversion including memref removal
   TypeConverter typeConverter;
-  typeConverter.addConversion([](Type type) { return type; });
+  typeConverter.addConversion([](Type type) -> Type {
+    if (type.isIndex()) {
+      return IntegerType::get(type.getContext(), 32);
+    }
+    return type;
+  });
+  // memref args are removed from signature and become internal memory
+  typeConverter.addConversion([](MemRefType) -> Type { return nullptr; });
 
   RewritePatternSet patterns(&getContext());
-  // Add function patterns from FunctionToCalyx.cpp
-  patterns.add<lowertocalyx::FuncFuncToCalyxPattern,
+  // Add complete function conversion pattern
+  patterns.add<lowertocalyx::CompleteFuncToComponentPattern,
                lowertocalyx::FuncReturnToCalyxPattern>(typeConverter,
                                                        &getContext());
 
@@ -648,11 +665,8 @@ LogicalResult LowerToCalyxPass::applyControlFlowWrapping(ModuleOp moduleOp) {
 }
 
 LogicalResult LowerToCalyxPass::applyClockResetConnections(ModuleOp moduleOp) {
-  llvm::errs() << "DEBUG: applyClockResetConnections() called\n";
   // Walk through all ComponentOp instances in the module
   for (auto componentOp : moduleOp.getOps<calyx::ComponentOp>()) {
-    llvm::errs() << "DEBUG: Processing component: " << componentOp.getName()
-                 << "\n";
     // Get the component's clock and reset ports
     Value clkPort = componentOp.getClkPort();
     Value resetPort = componentOp.getResetPort();
@@ -698,12 +712,15 @@ LogicalResult LowerToCalyxPass::applyClockResetConnections(ModuleOp moduleOp) {
                                              resetPort);
       } else if (auto multPipeOp = dyn_cast<calyx::MultPipeLibOp>(op)) {
         // MultPipeLibOp has 7 results: clk, reset, go, left, right, out, done
-        Value pipeClk = multPipeOp->getResult(0);    // clk
-        Value pipeReset = multPipeOp->getResult(1);  // reset
+        Value pipeClk = multPipeOp->getResult(0);   // clk
+        Value pipeReset = multPipeOp->getResult(1); // reset
 
-        // Create assignments to connect component clk/reset to pipelined operation clk/reset
-        wiresBuilder.create<calyx::AssignOp>(multPipeOp.getLoc(), pipeClk, clkPort);
-        wiresBuilder.create<calyx::AssignOp>(multPipeOp.getLoc(), pipeReset, resetPort);
+        // Create assignments to connect component clk/reset to pipelined
+        // operation clk/reset
+        wiresBuilder.create<calyx::AssignOp>(multPipeOp.getLoc(), pipeClk,
+                                             clkPort);
+        wiresBuilder.create<calyx::AssignOp>(multPipeOp.getLoc(), pipeReset,
+                                             resetPort);
       }
       // Add more primitive types as needed
       // For other primitives, we would need to check their result structure

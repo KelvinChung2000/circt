@@ -184,39 +184,8 @@ LogicalResult MemrefLoadToCalyxPattern::matchAndRewrite(
   rewriter.create<calyx::AssignOp>(loc, addrPort, addrOut);
 
   // Determine content enable signal based on address source
-  Value contentEnableSignal;
-
-  if (auto producerOp = indexValue.getDefiningOp()) {
-    // If the address comes from a register, use the register's done signal
-    if (auto regOp = dyn_cast<calyx::RegisterOp>(producerOp)) {
-      contentEnableSignal = regOp.getDone();
-    } else {
-      // For other operations, use the group's go signal
-      // Find the group that contains this load operation
-      auto groupOp = loadOp->getParentOfType<calyx::GroupOp>();
-      if (groupOp) {
-        // Look for existing group_go operations in the group
-        for (auto &op : groupOp.getBodyBlock()->getOperations()) {
-          if (auto groupGoOp = dyn_cast<calyx::GroupGoOp>(op)) {
-            contentEnableSignal = groupGoOp.getSrc();
-            break;
-          }
-        }
-
-        // If no group_go found, create constant true as fallback
-        if (!contentEnableSignal) {
-          contentEnableSignal =
-              getOrCreateConstant(componentOp.getOperation(), rewriter, 1);
-        }
-      }
-    }
-  }
-
-  // Fallback: use constant true if no content enable signal determined
-  if (!contentEnableSignal) {
-    contentEnableSignal =
-        getOrCreateConstant(componentOp.getOperation(), rewriter, 1);
-  }
+  Value contentEnableSignal =
+      resolveDoneSignalForValue(indexValue, loc, rewriter, componentOp);
 
   // Connect content enable signal to memory within the group
   rewriter.create<calyx::AssignOp>(loc, memOp.contentEn(), contentEnableSignal);
@@ -331,31 +300,8 @@ LogicalResult MemrefStoreToCalyxPattern::matchAndRewrite(
   rewriter.create<calyx::AssignOp>(loc, memOp.writeData(), valueToStore);
 
   // Determine write enable signal based on source data dependencies
-  Value writeEnableSignal;
-
-  if (auto producerOp = valueToStore.getDefiningOp()) {
-    // Check if the producer has a done signal (like registers or library
-    // operations)
-    if (auto libOp = dyn_cast<calyx::CellInterface>(producerOp)) {
-      // For Calyx library operations, check if they have done signals
-      for (auto result : producerOp->getResults()) {
-        if (result.getType().isSignlessInteger(1) && result != valueToStore) {
-          // Assume this is a done signal
-          writeEnableSignal = result;
-          break;
-        }
-      }
-    } else if (auto regOp = dyn_cast<calyx::RegisterOp>(producerOp)) {
-      // For registers, use the register's done signal
-      writeEnableSignal = regOp.getDone();
-    }
-  }
-
-  // Fallback: use constant 1 if no done signal found
-  if (!writeEnableSignal) {
-    writeEnableSignal =
-        getOrCreateConstant(componentOp.getOperation(), rewriter, 1);
-  }
+  Value writeEnableSignal =
+      resolveDoneSignalForValue(valueToStore, loc, rewriter, componentOp);
 
   // Connect write enable signal within the existing group
   rewriter.create<calyx::AssignOp>(loc, memOp.writeEn(), writeEnableSignal);
@@ -709,48 +655,65 @@ LogicalResult MemoryStoreToCalyxPattern::matchAndRewrite(
 LogicalResult FuncOpIndexConversionPattern::matchAndRewrite(
     func::FuncOp funcOp, func::FuncOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
-
+  
+  // Check if function needs index type conversion
   auto funcType = funcOp.getFunctionType();
-  bool needsUpdate = false;
+  bool hasIndexTypes = false;
+  
+  // Check for index types in inputs and results
+  for (Type inputType : funcType.getInputs()) {
+    if (inputType.isIndex()) {
+      hasIndexTypes = true;
+      break;
+    }
+  }
+  if (!hasIndexTypes) {
+    for (Type resultType : funcType.getResults()) {
+      if (resultType.isIndex()) {
+        hasIndexTypes = true;
+        break;
+      }
+    }
+  }
+  
+  if (!hasIndexTypes) {
+    return failure(); // Nothing to convert
+  }
 
-  // Check if any input types are index
+  // Convert function signature types
   SmallVector<Type> newInputTypes;
   for (Type inputType : funcType.getInputs()) {
     if (inputType.isIndex()) {
       newInputTypes.push_back(IntegerType::get(rewriter.getContext(), 32));
-      needsUpdate = true;
     } else {
       newInputTypes.push_back(inputType);
     }
   }
-
-  // Check if any result types are index
+  
   SmallVector<Type> newResultTypes;
   for (Type resultType : funcType.getResults()) {
     if (resultType.isIndex()) {
       newResultTypes.push_back(IntegerType::get(rewriter.getContext(), 32));
-      needsUpdate = true;
     } else {
       newResultTypes.push_back(resultType);
     }
   }
-
-  // Update function signature if needed
-  if (needsUpdate) {
-    auto newFuncType =
-        FunctionType::get(rewriter.getContext(), newInputTypes, newResultTypes);
-    funcOp.setType(newFuncType);
-  }
-
-  // Convert block arguments
-  for (Value arg : funcOp.getArguments()) {
+  
+  // Create new function type
+  auto newFuncType = FunctionType::get(rewriter.getContext(), newInputTypes, newResultTypes);
+  
+  // Update the function's type in place to avoid issues with region conversion
+  funcOp.setType(newFuncType);
+  
+  // Update argument types in place
+  for (unsigned i = 0; i < funcOp.getNumArguments(); ++i) {
+    Value arg = funcOp.getArgument(i);
     if (arg.getType().isIndex()) {
       arg.setType(IntegerType::get(rewriter.getContext(), 32));
-      needsUpdate = true;
     }
   }
-
-  return needsUpdate ? success() : failure();
+  
+  return success();
 }
 
 } // namespace lowertocalyx

@@ -169,6 +169,14 @@ struct FuncReturnToCalyxPattern
                   mlir::ConversionPatternRewriter &rewriter) const override;
 };
 
+// Complete function to component conversion pattern (final step)
+struct CompleteFuncToComponentPattern : mlir::OpConversionPattern<mlir::func::FuncOp> {
+  using mlir::OpConversionPattern<mlir::func::FuncOp>::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::func::FuncOp op, mlir::func::FuncOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override;
+};
+
 // Memory patterns
 
 template <typename OpType>
