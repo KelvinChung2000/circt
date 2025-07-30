@@ -154,6 +154,14 @@ struct FuncFuncToCalyxPattern : mlir::OpConversionPattern<mlir::func::FuncOp> {
                   mlir::ConversionPatternRewriter &rewriter) const override;
 };
 
+struct FuncReturnToCalyxPattern
+    : mlir::OpConversionPattern<mlir::func::ReturnOp> {
+  using mlir::OpConversionPattern<mlir::func::ReturnOp>::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::func::ReturnOp op, mlir::func::ReturnOpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override;
+};
+
 struct FuncCallToCalyxPattern : mlir::OpConversionPattern<mlir::func::CallOp> {
   using mlir::OpConversionPattern<mlir::func::CallOp>::OpConversionPattern;
   mlir::LogicalResult

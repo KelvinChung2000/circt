@@ -19,7 +19,7 @@ using namespace mlir;
 namespace circt {
 namespace lowertocalyx {
 
-LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
+LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
     mlir::func::FuncOp op, mlir::func::FuncOpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
 
@@ -175,6 +175,7 @@ LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
           }
         }
       }
+      op.getArgument(i).dropAllUses();
     } else {
       // Use TypeConverter for other types
       Type convertedType = typeConverter->convertType(inputType);
@@ -261,43 +262,116 @@ LogicalResult CompleteFuncToComponentPattern::matchAndRewrite(
   Block *funcBlock = &op.getBody().front();
   Block *componentBlock = componentOp.getBodyBlock();
 
-  for (auto &operation : llvm::make_early_inc_range(*funcBlock)) {
-    // if (isa<mlir::func::ReturnOp>(operation)) {
-    //   continue; // Skip return operations
-    // }
+  // Erase all non-terminator ops from componentBlock before cloning
+  for (auto it = componentBlock->begin(),
+            end = std::prev(componentBlock->end());
+       it != end;) {
+    auto *op = &*it++;
+    op->erase();
+  }
 
-    // Clone with value mapping
-    auto *clonedOp = rewriter.clone(operation, mapping);
+  // Map block arguments from funcBlock to componentBlock
+  for (size_t i = 0, e = funcBlock->getNumArguments(); i < e; ++i) {
+    mapping.map(funcBlock->getArgument(i), componentBlock->getArgument(i));
+  }
 
-    if (auto wiresOp = dyn_cast<calyx::WiresOp>(*clonedOp)) {
-      // Move contents of scaffolded wires into component wires, then erase the
-      // duplicate
-      if (componentWiresBlock) {
-        for (auto &innerOp : llvm::make_early_inc_range(
-                 wiresOp.getBodyBlock()->getOperations())) {
-          innerOp.moveBefore(componentWiresBlock, componentWiresBlock->begin());
-        }
+  // Clone all operations from funcBlock into componentBlock using the mapping
+  OpBuilder bodyBuilder(rewriter.getContext());
+  bodyBuilder.setInsertionPointToStart(componentBlock);
+  for (auto &opInst : funcBlock->without_terminator()) {
+    Operation *clonedOp = bodyBuilder.clone(opInst, mapping);
+    if (!clonedOp) {
+      llvm::errs() << "[Calyx] Error cloning op: " << opInst.getName() << "\n";
+      llvm::errs() << "[Calyx] Operands: ";
+      for (auto operand : opInst.getOperands()) {
+        llvm::errs() << operand << " ";
       }
-      clonedOp->erase();
-    } else if (auto controlOp = dyn_cast<calyx::ControlOp>(*clonedOp)) {
-      // Move contents of scaffolded control into component control, then erase
-      // the duplicate
-      if (componentControlBlock) {
-        for (auto &innerOp : llvm::make_early_inc_range(
-                 controlOp.getBodyBlock()->getOperations())) {
-          innerOp.moveBefore(componentControlBlock,
-                             componentControlBlock->begin());
-        }
+      llvm::errs() << "\n[Calyx] Mapping keys: ";
+      for (auto &kv : mapping.getValueMap()) {
+        llvm::errs() << kv.first << " ";
       }
-      clonedOp->erase();
-    } else {
-      // Other operations (memories, constants) go at component level
-      clonedOp->moveBefore(componentBlock, componentBlock->begin());
+      llvm::errs() << "\n";
+      opInst.emitError("Failed to clone operation. Likely due to unmapped SSA "
+                       "value or unsupported region.");
+      return failure();
     }
   }
 
   rewriter.replaceOp(op, componentOp);
 
+  return success();
+}
+
+LogicalResult FuncReturnToCalyxPattern::matchAndRewrite(
+    mlir::func::ReturnOp op, mlir::func::ReturnOpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+
+  auto componentOp = op->getParentOfType<calyx::ComponentOp>();
+  if (!componentOp) {
+    return rewriter.notifyMatchFailure(
+        op, "Return op not inside a Calyx component");
+  }
+
+  auto loc = op.getLoc();
+
+  // Get the wires operation to place assignments
+  auto wiresOp = componentOp.getWiresOp();
+  if (!wiresOp) {
+    return rewriter.notifyMatchFailure(op, "Component has no wires operation");
+  }
+
+  Block *componentWiresBlock = wiresOp.getBodyBlock();
+  OpBuilder wiresBuilder(componentWiresBlock, componentWiresBlock->end());
+
+  // Map return values to component output ports
+  if (!adaptor.getOperands().empty()) {
+    for (size_t i = 0; i < adaptor.getOperands().size(); ++i) {
+      Value returnValue = adaptor.getOperands()[i];
+
+      // Find the corresponding output port
+      // Component ports are: inputs, clk, reset, go, outputs, done
+      // We need to find the i-th output port
+      auto portInfos = componentOp.getPortInfo();
+      size_t outputPortIndex = 0;
+      Value outputPort = nullptr;
+
+      for (size_t portIdx = 0; portIdx < portInfos.size(); ++portIdx) {
+        if (portInfos[portIdx].direction == calyx::Direction::Output &&
+            portInfos[portIdx].name.getValue() != "done") {
+          if (outputPortIndex == i) {
+            outputPort = componentOp.getArgument(portIdx);
+            break;
+          }
+          outputPortIndex++;
+        }
+      }
+
+      if (!outputPort) {
+        return rewriter.notifyMatchFailure(
+            op, "Could not find output port for return value");
+      }
+
+      // Create assignment: output_port = return_value
+      wiresBuilder.create<calyx::AssignOp>(loc, outputPort, returnValue);
+    }
+  }
+
+  // // Handle done signal based on return value source
+  // Value doneSignal = nullptr;
+  // if (!adaptor.getOperands().empty()) {
+  //   Value returnValue = adaptor.getOperands()[0];
+  //   doneSignal =
+  //       resolveDoneSignalForValue(returnValue, wiresBuilder, componentOp);
+  // } else {
+  //   // No return values - use constant 1
+  //   doneSignal = getOrCreateConstant(componentOp, wiresBuilder, 1);
+  // }
+
+  // Assign done signal to component done port
+  // Value componentDonePort = componentOp.getDonePort();
+  // wiresBuilder.create<calyx::AssignOp>(loc, componentDonePort, doneSignal);
+
+  rewriter.eraseOp(op);
   return success();
 }
 

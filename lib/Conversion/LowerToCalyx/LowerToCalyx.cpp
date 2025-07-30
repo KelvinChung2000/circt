@@ -514,8 +514,8 @@ LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
 
   RewritePatternSet patterns(&getContext());
   // Add complete function conversion pattern
-  patterns.add<lowertocalyx::CompleteFuncToComponentPattern>(typeConverter,
-                                                             &getContext());
+  patterns.add<lowertocalyx::FuncFuncToCalyxPattern>(typeConverter,
+                                                     &getContext());
 
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
