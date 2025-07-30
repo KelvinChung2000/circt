@@ -15,6 +15,28 @@ include "mlir/IR/BuiltinAttributeInterfaces.td"
 def I3  : I<3>;
 def I5  : I<5>;
 
+def UnaryOpTrait : NativeOpTrait<"UnaryOpTrait"> {
+  let cppNamespace = "::circt::calyx";
+}
+
+def BinaryOpTrait : NativeOpTrait<"BinaryOpTrait"> {
+  let cppNamespace = "::circt::calyx";
+}
+
+def SequentialTrait : NativeOpTrait<"SequentialTrait"> {
+  let cppNamespace = "::circt::calyx";
+}
+
+
+def PipelineTrait : NativeOpTrait<"PipelineTrait"> {
+  let cppNamespace = "::circt::calyx";
+}
+
+def MemoryOpTrait : NativeOpTrait<"MemoryOpTrait"> {
+  let cppNamespace = "::circt::calyx";
+}
+
+
 /// Base class for Calyx primitives.
 class CalyxPrimitive<string mnemonic, list<Trait> traits = []> :
   CalyxCell<mnemonic, traits> {
@@ -188,7 +210,7 @@ def MemoryOp : CalyxPrimitive<"memory", []> {
   }];
 }
 
-def SeqMemoryOp : CalyxPrimitive<"seq_mem", []> {
+def SeqMemoryOp : CalyxPrimitive<"seq_mem", [MemoryOpTrait]> {
   let summary = "Defines a memory with sequential read";
   let description = [{
     The "calyx.seq_mem" op defines a memory with sequential reads. Memories can
@@ -314,12 +336,14 @@ def SleLibOp  : BoolBinaryLibraryOp<"sle"> {}
 
 class ArithBinaryLibraryOp<string mnemonic, string prefix, list<Trait> traits = []> :
   CalyxLibraryOp<mnemonic, prefix, !listconcat(traits, [
-    SameTypeConstraint<"left", "right">
+    BinaryOpTrait,
+    SameTypeConstraint<"left", "right">,
   ])> {}
 
 class CombinationalArithBinaryLibraryOp<string mnemonic> :
   ArithBinaryLibraryOp<mnemonic, "std_", [
     Combinational,
+    BinaryOpTrait,
     SameTypeConstraint<"left", "out">
   ]> {
   let results = (outs AnyType:$left, AnyType:$right, AnyType:$out);
@@ -527,7 +551,9 @@ def MuxLibOp : CalyxLibraryOp<"mux", "std_", [
 }
 
 class ArithBinaryPipeLibraryOp<string mnemonic> : ArithBinaryLibraryOp<mnemonic # "_pipe", "std_", [
-    SameTypeConstraint<"left", "out">
+    SameTypeConstraint<"left", "out">,
+    PipelineTrait,
+    BinaryOpTrait
   ]> {
   let results = (outs I1:$clk, I1:$reset, I1:$go, AnyType:$left, AnyType:$right, AnyType:$out, I1:$done);
 }
@@ -539,7 +565,7 @@ def RemUPipeLibOp : ArithBinaryPipeLibraryOp<"remu"> {}
 def RemSPipeLibOp : ArithBinaryPipeLibraryOp<"rems"> {}
 
 class UnaryLibraryOp<string mnemonic, string prefix, list<Trait> traits = []> :
-    CalyxLibraryOp<mnemonic, prefix, !listconcat(traits, [Combinational])> {
+    CalyxLibraryOp<mnemonic, prefix, !listconcat(traits, [Combinational, UnaryOpTrait])> {
   let results = (outs AnyInteger:$in, AnyInteger:$out);
 }
 
