@@ -9,6 +9,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/RegionUtils.h"
 
 #include <cassert>
 
@@ -47,7 +48,13 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
   SmallVector<Type> outputTypes;
   SmallVector<std::pair<size_t, MemRefType>> memrefArgs; // argIndex, memrefType
 
-  auto wiresOp = *op.getFunctionBody().getOps<calyx::WiresOp>().begin();
+  // Check if function already has Calyx operations (scaffolded)
+  auto wiresOps = op.getFunctionBody().getOps<calyx::WiresOp>();
+  if (wiresOps.empty()) {
+    return rewriter.notifyMatchFailure(
+        op, "Function must be scaffolded with Calyx operations first");
+  }
+  auto wiresOp = *wiresOps.begin();
   OpBuilder componentBuilder(rewriter.getContext());
   componentBuilder.setInsertionPoint(wiresOp);
 
@@ -227,14 +234,22 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
   // Add mandatory component ports (clk, reset, go, done)
   calyx::addMandatoryComponentPorts(rewriter, ports);
 
+  // Set insertion point to replace the function
+  rewriter.setInsertionPoint(op);
+
   // Create the component operation
   auto componentOp = rewriter.create<calyx::ComponentOp>(
       loc, rewriter.getStringAttr(op.getName()), ports);
 
-  // Clone the body of the FuncOp into the ComponentOp
+  // Get the function's block
+  Block *funcBlock = &op.getBody().front();
+
+  // Create IR mapping for function arguments to component arguments
   IRMapping mapping;
-  // Map function arguments to component input ports (excluding memrefs)
-  size_t inputPortIdx = 0;
+
+  // Map function arguments to component arguments (for non-memref only)
+  // Component arguments: [non-memref inputs, clk, reset, go, outputs, done]
+  size_t componentArgIndex = 0;
   for (size_t i = 0; i < op.getNumArguments(); ++i) {
     bool isMemref = false;
     for (auto &memrefArg : memrefArgs) {
@@ -243,62 +258,58 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
         break;
       }
     }
+
     if (!isMemref) {
-      mapping.map(op.getArgument(i), componentOp.getArgument(inputPortIdx));
-      inputPortIdx++;
+      // Map function argument to component argument
+      // Skip clk, reset, go ports - they start after the input ports
+      mapping.map(op.getArgument(i),
+                  componentOp.getArgument(componentArgIndex));
+      componentArgIndex++;
     }
-    // Memref arguments are handled separately (not mapped to ports)
+    // memref arguments should have their uses replaced by memory operations
+    // above
   }
 
-  // Get the auto-generated empty wires and control ops from the component
-  auto componentWiresOp = componentOp.getWiresOp();
-  auto componentControlOp = componentOp.getControlOp();
-  Block *componentWiresBlock =
-      componentWiresOp ? componentWiresOp.getBodyBlock() : nullptr;
-  Block *componentControlBlock =
-      componentControlOp ? componentControlOp.getBodyBlock() : nullptr;
+  // Argument mapping is set up correctly
 
-  // Move all operations from the scaffolded function, organizing them properly
-  Block *funcBlock = &op.getBody().front();
-  Block *componentBlock = componentOp.getBodyBlock();
-
-  // Erase all non-terminator ops from componentBlock before cloning
-  for (auto it = componentBlock->begin(),
-            end = std::prev(componentBlock->end());
-       it != end;) {
-    auto *op = &*it++;
-    op->erase();
-  }
-
-  // Map block arguments from funcBlock to componentBlock
-  for (size_t i = 0, e = funcBlock->getNumArguments(); i < e; ++i) {
-    mapping.map(funcBlock->getArgument(i), componentBlock->getArgument(i));
-  }
-
-  // Clone all operations from funcBlock into componentBlock using the mapping
-  OpBuilder bodyBuilder(rewriter.getContext());
-  bodyBuilder.setInsertionPointToStart(componentBlock);
-  for (auto &opInst : funcBlock->without_terminator()) {
-    Operation *clonedOp = bodyBuilder.clone(opInst, mapping);
-    if (!clonedOp) {
-      llvm::errs() << "[Calyx] Error cloning op: " << opInst.getName() << "\n";
-      llvm::errs() << "[Calyx] Operands: ";
-      for (auto operand : opInst.getOperands()) {
-        llvm::errs() << operand << " ";
+  // Use MLIR's RegionUtils to replace function argument uses in the function
+  // region
+  for (size_t i = 0; i < op.getNumArguments(); ++i) {
+    bool isMemref = false;
+    for (auto &memrefArg : memrefArgs) {
+      if (memrefArg.first == i) {
+        isMemref = true;
+        break;
       }
-      llvm::errs() << "\n[Calyx] Mapping keys: ";
-      for (auto &kv : mapping.getValueMap()) {
-        llvm::errs() << kv.first << " ";
-      }
-      llvm::errs() << "\n";
-      opInst.emitError("Failed to clone operation. Likely due to unmapped SSA "
-                       "value or unsupported region.");
-      return failure();
+    }
+
+    if (!isMemref && mapping.lookupOrNull(op.getArgument(i))) {
+      Value functionArg = op.getArgument(i);
+      Value componentArg = mapping.lookupOrNull(functionArg);
+
+      // Use MLIR's proper API to replace uses within the function region
+      replaceAllUsesInRegionWith(functionArg, componentArg, op.getBody());
     }
   }
 
-  rewriter.replaceOp(op, componentOp);
+  // SECOND: Now setup component structure and move operations
+  // Get the component's wires block to place operations
+  componentOp.getWiresOp().erase();
+  componentOp.getControlOp().erase();
 
+  Block *compBlock = componentOp.getBodyBlock();
+
+  // Use rewriter to move operations from function block to component wires
+  // block This preserves the operations for other patterns to convert them
+  rewriter.setInsertionPointToEnd(compBlock);
+
+  // Move operations one by one using the rewriter
+  for (auto &opToMove :
+       llvm::make_early_inc_range(funcBlock->getOperations())) {
+    opToMove.moveBefore(compBlock, compBlock->end());
+  }
+
+  op.erase();
   return success();
 }
 
@@ -356,20 +367,20 @@ LogicalResult FuncReturnToCalyxPattern::matchAndRewrite(
     }
   }
 
-  // // Handle done signal based on return value source
-  // Value doneSignal = nullptr;
-  // if (!adaptor.getOperands().empty()) {
-  //   Value returnValue = adaptor.getOperands()[0];
-  //   doneSignal =
-  //       resolveDoneSignalForValue(returnValue, wiresBuilder, componentOp);
-  // } else {
-  //   // No return values - use constant 1
-  //   doneSignal = getOrCreateConstant(componentOp, wiresBuilder, 1);
-  // }
+  // Handle done signal based on return value source
+  Value doneSignal = nullptr;
+  if (!adaptor.getOperands().empty()) {
+    Value returnValue = adaptor.getOperands()[0];
+    doneSignal =
+        resolveDoneSignalForValue(returnValue, wiresBuilder, componentOp);
+  } else {
+    // No return values - use constant 1
+    doneSignal = getOrCreateConstant(componentOp, wiresBuilder, 1);
+  }
 
   // Assign done signal to component done port
-  // Value componentDonePort = componentOp.getDonePort();
-  // wiresBuilder.create<calyx::AssignOp>(loc, componentDonePort, doneSignal);
+  Value componentDonePort = componentOp.getDonePort();
+  wiresBuilder.create<calyx::AssignOp>(loc, componentDonePort, doneSignal);
 
   rewriter.eraseOp(op);
   return success();
