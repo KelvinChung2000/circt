@@ -34,13 +34,9 @@ std::string getOpUniqueName(mlir::Operation *op);
 /// - For operations with multiple i1 results: finds and returns done signal
 /// - For operations with calyx.done attribute: returns that result
 /// - Fallback: creates and returns constant 1 for immediate values
-mlir::Value resolveDoneSignalForValue(mlir::Value val, mlir::Location loc,
-                                     mlir::OpBuilder &builder);
 
-/// Overload that uses constant deduplication for component operations
-mlir::Value resolveDoneSignalForValue(mlir::Value val, mlir::Location loc,
-                                     mlir::OpBuilder &builder,
-                                     mlir::Operation *componentOp);
+mlir::Value resolveDoneSignalForValue(mlir::Value val,
+                                      mlir::Operation *componentOp);
 
 /// Updates the component's done port connection with the provided done signal.
 /// This function finds the component's done port and creates an assignment
@@ -49,35 +45,38 @@ void updateComponentDoneConnection(circt::calyx::ComponentOp comp,
                                    mlir::Value newDone, mlir::Location loc,
                                    mlir::OpBuilder &builder);
 
-/// Returns or creates a hw::ConstantOp with the specified value within the given operation.
-/// If a constant with the same value and bit width already exists in the operation's body, returns that constant.
-/// Otherwise, creates a new constant at the operation level and returns it.
-/// If bitWidth is not provided (std::nullopt), defaults to 1 bit (suitable for boolean constants).
-/// This helps avoid duplicate constant operations in the IR and ensures consistent placement.
-/// Accepts either func::FuncOp or calyx::ComponentOp.
-mlir::Value getOrCreateConstant(mlir::Operation *parentOp,
-                               mlir::ConversionPatternRewriter &rewriter,
-                               int64_t value, 
-                               std::optional<unsigned> bitWidth = std::nullopt);
+/// Returns or creates a hw::ConstantOp with the specified value within the
+/// given operation. If a constant with the same value and bit width already
+/// exists in the operation's body, returns that constant. Otherwise, creates a
+/// new constant at the operation level and returns it. If bitWidth is not
+/// provided (std::nullopt), defaults to 1 bit (suitable for boolean constants).
+/// This helps avoid duplicate constant operations in the IR and ensures
+/// consistent placement. Accepts either func::FuncOp or calyx::ComponentOp.
+mlir::Value
+getOrCreateConstant(mlir::Operation *parentOp, int64_t value,
+                    std::optional<unsigned> bitWidth = std::nullopt);
 
-/// Overload for regular OpBuilder (for use in non-conversion contexts)
-mlir::Value getOrCreateConstant(mlir::Operation *parentOp,
-                               mlir::OpBuilder &builder,
-                               int64_t value, 
-                               std::optional<unsigned> bitWidth = std::nullopt);
+/// Unified utility functions that take only parentOp, value, and optional
+/// bitwidth These functions always set the insertion point at the parentOp and
+/// handle both ConversionPatternRewriter and OpBuilder contexts automatically
+
+/// Creates a register in the parent component's cells block
+mlir::Value createReg(mlir::Operation *parentOp, mlir::Type type,
+                      llvm::StringRef name = "");
 
 /// Generic "find or create" utility for any operation type
-/// This template function searches for existing operations of type OpType with matching attributes
-/// and creates a new one if none exists, avoiding duplicates
-template<typename OpType>
-mlir::Operation* getOrCreateOperation(mlir::Operation *parentOp,
-                                     mlir::OpBuilder &builder,
-                                     mlir::Location loc,
-                                     llvm::function_ref<bool(OpType)> matcher,
-                                     llvm::function_ref<OpType()> creator) {
+/// This template function searches for existing operations of type OpType with
+/// matching attributes and creates a new one if none exists, avoiding
+/// duplicates
+template <typename OpType>
+mlir::Operation *getOrCreateOperation(mlir::Operation *parentOp,
+                                      mlir::OpBuilder &builder,
+                                      mlir::Location loc,
+                                      llvm::function_ref<bool(OpType)> matcher,
+                                      llvm::function_ref<OpType()> creator) {
   // Get the body block from either func::FuncOp or calyx::ComponentOp
   mlir::Block *bodyBlock = nullptr;
-  
+
   if (auto funcOp = dyn_cast<mlir::func::FuncOp>(parentOp)) {
     bodyBlock = &funcOp.getBody().front();
   } else if (auto componentOp = dyn_cast<circt::calyx::ComponentOp>(parentOp)) {
@@ -90,11 +89,11 @@ mlir::Operation* getOrCreateOperation(mlir::Operation *parentOp,
       return nullptr; // Cannot determine body block
     }
   }
-  
+
   if (!bodyBlock) {
     return nullptr;
   }
-  
+
   // Search for existing operation that matches the criteria
   for (auto &op : bodyBlock->getOperations()) {
     if (auto typedOp = dyn_cast<OpType>(op)) {
@@ -103,11 +102,11 @@ mlir::Operation* getOrCreateOperation(mlir::Operation *parentOp,
       }
     }
   }
-  
+
   // If no matching operation exists, create a new one
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(bodyBlock);
-  
+
   auto newOp = creator();
   return newOp.getOperation();
 }

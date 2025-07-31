@@ -106,7 +106,7 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
           }
           // Note: Don't need to assign to loadOp.getResult() - we replace the
           // entire operation
-          auto true_value = getOrCreateConstant(op, componentBuilder, 1);
+          auto true_value = getOrCreateConstant(op, 1);
           loadBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
                                               true_value);
           loadOp.replaceAllUsesWith(memOp.readData());
@@ -129,7 +129,7 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
           }
           storeBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
                                                storeOp.getValueToStore());
-          auto true_value = getOrCreateConstant(op, componentBuilder, 1);
+          auto true_value = getOrCreateConstant(op, 1);
           storeBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
                                                true_value);
           storeOp.erase();
@@ -152,7 +152,7 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
             }
             // Note: Don't need to assign to loadOp.getResult() - we replace the
             // entire operation
-            auto true_value = getOrCreateConstant(op, rewriter, 1);
+            auto true_value = getOrCreateConstant(op, 1);
             loadBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
                                                 true_value);
             loadOp.replaceAllUsesWith(memOp.readData());
@@ -175,7 +175,7 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
             }
             storeBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
                                                  storeOp.getValueToStore());
-            auto true_value = getOrCreateConstant(op, rewriter, 1);
+            auto true_value = getOrCreateConstant(op, 1);
             storeBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
                                                  true_value);
             storeOp.erase();
@@ -244,11 +244,6 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
   // Get the function's block
   Block *funcBlock = &op.getBody().front();
 
-  // Create IR mapping for function arguments to component arguments
-  IRMapping mapping;
-
-  // Map function arguments to component arguments (for non-memref only)
-  // Component arguments: [non-memref inputs, clk, reset, go, outputs, done]
   size_t componentArgIndex = 0;
   for (size_t i = 0; i < op.getNumArguments(); ++i) {
     bool isMemref = false;
@@ -260,32 +255,9 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
     }
 
     if (!isMemref) {
-      // Map function argument to component argument
-      // Skip clk, reset, go ports - they start after the input ports
-      mapping.map(op.getArgument(i),
-                  componentOp.getArgument(componentArgIndex));
-      componentArgIndex++;
-    }
-    // memref arguments should have their uses replaced by memory operations
-    // above
-  }
-
-  // Argument mapping is set up correctly
-
-  // Use MLIR's RegionUtils to replace function argument uses in the function
-  // region
-  for (size_t i = 0; i < op.getNumArguments(); ++i) {
-    bool isMemref = false;
-    for (auto &memrefArg : memrefArgs) {
-      if (memrefArg.first == i) {
-        isMemref = true;
-        break;
-      }
-    }
-
-    if (!isMemref && mapping.lookupOrNull(op.getArgument(i))) {
       Value functionArg = op.getArgument(i);
-      Value componentArg = mapping.lookupOrNull(functionArg);
+      Value componentArg = componentOp.getArgument(componentArgIndex);
+      componentArgIndex++;
 
       // Use MLIR's proper API to replace uses within the function region
       replaceAllUsesInRegionWith(functionArg, componentArg, op.getBody());
@@ -371,11 +343,10 @@ LogicalResult FuncReturnToCalyxPattern::matchAndRewrite(
   Value doneSignal = nullptr;
   if (!adaptor.getOperands().empty()) {
     Value returnValue = adaptor.getOperands()[0];
-    doneSignal =
-        resolveDoneSignalForValue(returnValue, wiresBuilder, componentOp);
+    doneSignal = resolveDoneSignalForValue(returnValue, componentOp);
   } else {
     // No return values - use constant 1
-    doneSignal = getOrCreateConstant(componentOp, wiresBuilder, 1);
+    doneSignal = getOrCreateConstant(componentOp, 1);
   }
 
   // Assign done signal to component done port

@@ -155,7 +155,7 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
 
   wiresBuilder.create<calyx::AssignOp>(loc, leftPort, lhs);
   wiresBuilder.create<calyx::AssignOp>(loc, rightPort, rhs);
-  auto true_value = getOrCreateConstant(topLevelOp, rewriter, 1);
+  auto true_value = getOrCreateConstant(topLevelOp, 1);
   rewriter.create<calyx::AssignOp>(loc, libOp.getGo(), true_value);
 
   // Replace the original arith operation result with the library operation
@@ -306,8 +306,8 @@ LogicalResult ArithSpecialOpToCalyxPattern<OpType>::matchAndRewrite(
         bitWidth = intAttr.getType().getIntOrFloatBitWidth();
       }
 
-      auto constantValue = getOrCreateConstant(
-          componentOp.getOperation(), rewriter, intAttr.getInt(), bitWidth);
+      auto constantValue = getOrCreateConstant(componentOp.getOperation(),
+                                               intAttr.getInt(), bitWidth);
       rewriter.replaceOp(op, constantValue);
       return success();
     } else if (auto floatAttr = dyn_cast<FloatAttr>(value)) {

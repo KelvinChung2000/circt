@@ -185,7 +185,7 @@ LogicalResult MemrefLoadToCalyxPattern::matchAndRewrite(
 
   // Determine content enable signal based on address source
   Value contentEnableSignal =
-      resolveDoneSignalForValue(indexValue, loc, rewriter, componentOp);
+      resolveDoneSignalForValue(indexValue, componentOp);
 
   // Connect content enable signal to memory within the group
   rewriter.create<calyx::AssignOp>(loc, memOp.contentEn(), contentEnableSignal);
@@ -301,7 +301,7 @@ LogicalResult MemrefStoreToCalyxPattern::matchAndRewrite(
 
   // Determine write enable signal based on source data dependencies
   Value writeEnableSignal =
-      resolveDoneSignalForValue(valueToStore, loc, rewriter, componentOp);
+      resolveDoneSignalForValue(valueToStore, componentOp);
 
   // Connect write enable signal within the existing group
   rewriter.create<calyx::AssignOp>(loc, memOp.writeEn(), writeEnableSignal);
@@ -632,14 +632,12 @@ LogicalResult MemoryStoreToCalyxPattern::matchAndRewrite(
 
       // Fallback: use constant 1 for immediate values (constants, arguments)
       if (!writeEnableSignal) {
-        writeEnableSignal =
-            getOrCreateConstant(componentOp.getOperation(), rewriter, 1);
+        writeEnableSignal = getOrCreateConstant(componentOp.getOperation(), 1);
       }
     }
   } else {
     // Value is a block argument (function parameter) - use constant 1
-    writeEnableSignal =
-        getOrCreateConstant(componentOp.getOperation(), rewriter, 1);
+    writeEnableSignal = getOrCreateConstant(componentOp.getOperation(), 1);
   }
 
   Value writeEn = memOp.writeEn();
@@ -655,11 +653,11 @@ LogicalResult MemoryStoreToCalyxPattern::matchAndRewrite(
 LogicalResult FuncOpIndexConversionPattern::matchAndRewrite(
     func::FuncOp funcOp, func::FuncOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
-  
+
   // Check if function needs index type conversion
   auto funcType = funcOp.getFunctionType();
   bool hasIndexTypes = false;
-  
+
   // Check for index types in inputs and results
   for (Type inputType : funcType.getInputs()) {
     if (inputType.isIndex()) {
@@ -675,7 +673,7 @@ LogicalResult FuncOpIndexConversionPattern::matchAndRewrite(
       }
     }
   }
-  
+
   if (!hasIndexTypes) {
     return failure(); // Nothing to convert
   }
@@ -689,7 +687,7 @@ LogicalResult FuncOpIndexConversionPattern::matchAndRewrite(
       newInputTypes.push_back(inputType);
     }
   }
-  
+
   SmallVector<Type> newResultTypes;
   for (Type resultType : funcType.getResults()) {
     if (resultType.isIndex()) {
@@ -698,13 +696,14 @@ LogicalResult FuncOpIndexConversionPattern::matchAndRewrite(
       newResultTypes.push_back(resultType);
     }
   }
-  
+
   // Create new function type
-  auto newFuncType = FunctionType::get(rewriter.getContext(), newInputTypes, newResultTypes);
-  
+  auto newFuncType =
+      FunctionType::get(rewriter.getContext(), newInputTypes, newResultTypes);
+
   // Update the function's type in place to avoid issues with region conversion
   funcOp.setType(newFuncType);
-  
+
   // Update argument types in place
   for (unsigned i = 0; i < funcOp.getNumArguments(); ++i) {
     Value arg = funcOp.getArgument(i);
@@ -712,7 +711,7 @@ LogicalResult FuncOpIndexConversionPattern::matchAndRewrite(
       arg.setType(IntegerType::get(rewriter.getContext(), 32));
     }
   }
-  
+
   return success();
 }
 

@@ -71,7 +71,7 @@ private:
   LogicalResult scaffoldCalyxStructure(mlir::func::FuncOp funcOp);
 
   /// Step 2: Convert all basic blocks into Calyx groups.
-  LogicalResult convertBlocksToGroups(mlir::func::FuncOp funcOp);
+  LogicalResult convertBlocksToGroups(ModuleOp moduleOp);
 
   /// Step 3: Apply control flow patterns using the separated pattern classes
   LogicalResult applyControlFlowPatterns(ModuleOp moduleOp);
@@ -149,18 +149,10 @@ void LowerToCalyxPass::runOnOperation() {
     return;
   }
 
-  // // Step 2: Convert blocks to calyx groups (for all functions)
-  // for (auto funcOp : moduleOp.getOps<mlir::func::FuncOp>()) {
-  //   if (shouldProcessFunction(funcOp)) {
-  //     // Run block-to-groups for all functions
-  //     // The block-to-groups phase handles both simple and SCF control flow
-  //     // cases
-  //     if (failed(convertBlocksToGroups(funcOp))) {
-  //       signalPassFailure();
-  //       return;
-  //     }
-  //   }
-  // }
+  if (failed(convertBlocksToGroups(moduleOp))) {
+    signalPassFailure();
+    return;
+  }
 
   // // Step 6: Apply empty group optimization first, then control flow wrapping
   // if (failed(applyEmptyGroupOptimization(moduleOp))) {
@@ -280,11 +272,13 @@ LogicalResult LowerToCalyxPass::applyControlFlowPatterns(ModuleOp moduleOp) {
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 
-LogicalResult
-LowerToCalyxPass::convertBlocksToGroups(mlir::func::FuncOp funcOp) {
-  auto &entryBlock = funcOp.front();
-  auto wiresOp = *entryBlock.getOps<calyx::WiresOp>().begin();
-  auto controlOp = *entryBlock.getOps<calyx::ControlOp>().begin();
+LogicalResult LowerToCalyxPass::convertBlocksToGroups(ModuleOp moduleOp) {
+  // Get the first calyx::ComponentOp in the module
+
+  calyx::ComponentOp componentOp =
+      *(moduleOp.getOps<calyx::ComponentOp>().begin());
+  auto wiresOp = componentOp.getWiresOp();
+  auto controlOp = componentOp.getControlOp();
   OpBuilder wiresBuilder(&wiresOp.getBody().front(),
                          wiresOp.getBody().front().end());
   int groupCounter = 0;
@@ -322,7 +316,7 @@ LowerToCalyxPass::convertBlocksToGroups(mlir::func::FuncOp funcOp) {
       // Create a group for the block operations
       std::string groupName = "bb" + std::to_string(groupCounter++);
       auto groupOp =
-          wiresBuilder.create<calyx::GroupOp>(funcOp.getLoc(), groupName);
+          wiresBuilder.create<calyx::GroupOp>(componentOp.getLoc(), groupName);
 
       Block *groupBodyBlock = groupOp.getBodyBlock();
 
@@ -343,19 +337,19 @@ LowerToCalyxPass::convertBlocksToGroups(mlir::func::FuncOp funcOp) {
         // Create constant at component level using deduplication helper
         // At this point, funcOp should already be converted to a
         // calyx.component
-        OpBuilder componentBuilder(&entryBlock, entryBlock.end());
-        auto constOne =
-            getOrCreateConstant(funcOp.getOperation(), componentBuilder, 1);
+        OpBuilder componentBuilder(componentOp.getBodyBlock(),
+                                   componentOp.getBodyBlock()->end());
+        auto constOne = getOrCreateConstant(componentOp, 1);
 
         // Then create group_done in the group
         OpBuilder groupBuilder(groupBodyBlock, groupBodyBlock->end());
-        groupBuilder.create<calyx::GroupDoneOp>(funcOp.getLoc(), constOne);
+        groupBuilder.create<calyx::GroupDoneOp>(componentOp.getLoc(), constOne);
       }
 
       // Insert enable operation at the beginning of the block where ops were
       // moved from
       OpBuilder blockBuilder(block, block->begin());
-      blockBuilder.create<calyx::EnableOp>(funcOp.getLoc(),
+      blockBuilder.create<calyx::EnableOp>(componentOp.getLoc(),
                                            groupOp.getSymName());
     }
   }
@@ -497,8 +491,8 @@ LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
 
   // Mark function operations as illegal
   target.addIllegalOp<mlir::func::FuncOp>();
-  // Keep func.return legal for now - will be handled in a later pass
-  target.addLegalOp<mlir::func::ReturnOp>();
+  // Mark func.return as illegal so it gets converted
+  // target.addIllegalOp<mlir::func::ReturnOp>();
 
   // Set up type converter with complete type conversion including memref
   // removal
@@ -516,6 +510,9 @@ LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
   // Add complete function conversion pattern
   patterns.add<lowertocalyx::FuncFuncToCalyxPattern>(typeConverter,
                                                      &getContext());
+  // Add return conversion pattern
+  patterns.add<lowertocalyx::FuncReturnToCalyxPattern>(typeConverter,
+                                                       &getContext());
 
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }

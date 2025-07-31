@@ -111,7 +111,7 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
   }
 
   // Create constant 1 for write enable using deduplication
-  auto constantOne = getOrCreateConstant(funcOp.getOperation(), functionBuilder, 1);
+  auto constantOne = getOrCreateConstant(funcOp.getOperation(), 1);
 
   // Replace all uses of the scf.if result with the register output
   ifResult.replaceAllUsesWith(regOut);
@@ -127,8 +127,7 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
         builder.create<calyx::AssignOp>(op.getLoc(), regIn, thenYieldValue,
                                         ifOp.getCondition());
         // Create assignment: reg.write_en = 1
-        builder.create<calyx::AssignOp>(op.getLoc(), regWriteEn,
-                                        constantOne,
+        builder.create<calyx::AssignOp>(op.getLoc(), regWriteEn, constantOne,
                                         ifOp.getCondition());
         // Create group_done
         builder.create<calyx::GroupDoneOp>(op.getLoc(), regDone);
@@ -155,8 +154,7 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
         builder.create<calyx::AssignOp>(op.getLoc(), regIn, elseYieldValue,
                                         invertedCondition.getOut());
         // Create assignment: reg.write_en = 1
-        builder.create<calyx::AssignOp>(op.getLoc(), regWriteEn,
-                                        constantOne,
+        builder.create<calyx::AssignOp>(op.getLoc(), regWriteEn, constantOne,
                                         invertedCondition.getOut());
         // Create group_done
         builder.create<calyx::GroupDoneOp>(op.getLoc(), regDone);
@@ -291,12 +289,13 @@ LogicalResult ScfToCalyxPattern<mlir::scf::WhileOp>::matchAndRewrite(
 // Helper function to check if a group only contains done signals
 static bool groupOnlyHasDone(calyx::GroupOp groupOp) {
   auto *groupBlock = groupOp.getBodyBlock();
-  if (!groupBlock) return false;
-  
+  if (!groupBlock)
+    return false;
+
   // Count non-done operations
   size_t nonDoneOpsCount = 0;
   bool hasDone = false;
-  
+
   for (auto &op : *groupBlock) {
     if (isa<calyx::GroupDoneOp>(op)) {
       hasDone = true;
@@ -305,25 +304,27 @@ static bool groupOnlyHasDone(calyx::GroupOp groupOp) {
       nonDoneOpsCount++;
     }
   }
-  
+
   // Group only has done if it has a done signal and no other operations
   return hasDone && (nonDoneOpsCount == 0);
 }
 
 // Helper function to find the group referenced by an enable operation
-static calyx::GroupOp findReferencedGroup(calyx::EnableOp enableOp, calyx::ComponentOp componentOp) {
+static calyx::GroupOp findReferencedGroup(calyx::EnableOp enableOp,
+                                          calyx::ComponentOp componentOp) {
   StringRef groupName = enableOp.getGroupName();
-  
+
   // Search for the group in the component's wires section
   auto wiresOp = componentOp.getWiresOp();
-  if (!wiresOp) return nullptr;
-  
+  if (!wiresOp)
+    return nullptr;
+
   for (auto groupOp : wiresOp.getOps<calyx::GroupOp>()) {
     if (groupOp.getSymName() == groupName) {
       return groupOp;
     }
   }
-  
+
   return nullptr;
 }
 
@@ -348,9 +349,10 @@ LogicalResult ControlFlowWrappingPattern::matchAndRewrite(
     return failure(); // No parent component found
   }
 
-  // TODO: Before wrapping, check each enable signal and remove groups that only have done
-  // For now, this optimization is disabled to avoid rewriter issues
-  // Future work: Implement safe group removal that doesn't interfere with the rewriter pattern
+  // TODO: Before wrapping, check each enable signal and remove groups that only
+  // have done For now, this optimization is disabled to avoid rewriter issues
+  // Future work: Implement safe group removal that doesn't interfere with the
+  // rewriter pattern
 
   // Re-collect control operations after potential removals
   SmallVector<Operation *> controlOps;
@@ -422,16 +424,16 @@ LogicalResult EmptyGroupOptimizationPattern::matchAndRewrite(
   }
 
   auto &controlBlock = controlRegion.front();
-  
+
   // Collect groups that only have done signals and their corresponding enables
   SmallVector<calyx::GroupOp> groupsToRemove;
   SmallVector<calyx::EnableOp> enablesToRemove;
-  
+
   // First, identify groups that only have done signals
   for (auto groupOp : wiresOp.getOps<calyx::GroupOp>()) {
     if (groupOnlyHasDone(groupOp)) {
       groupsToRemove.push_back(groupOp);
-      
+
       // Find enables that reference this group
       StringRef groupName = groupOp.getSymName();
       controlBlock.walk([&](calyx::EnableOp enableOp) {
@@ -441,16 +443,16 @@ LogicalResult EmptyGroupOptimizationPattern::matchAndRewrite(
       });
     }
   }
-  
+
   if (groupsToRemove.empty()) {
     return failure(); // No empty groups found
   }
-  
+
   // Remove the enables first
   for (auto enableOp : enablesToRemove) {
     rewriter.eraseOp(enableOp);
   }
-  
+
   // Then remove the groups
   for (auto groupOp : groupsToRemove) {
     rewriter.eraseOp(groupOp);

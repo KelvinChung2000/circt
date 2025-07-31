@@ -133,8 +133,7 @@ std::string getOpUniqueName(mlir::Operation *op) {
 }
 
 // Overload that uses constant deduplication
-mlir::Value resolveDoneSignalForValue(mlir::Value val, mlir::Location loc,
-                                      mlir::OpBuilder &builder,
+mlir::Value resolveDoneSignalForValue(mlir::Value val,
                                       mlir::Operation *componentOp) {
 
   if (auto producerOp = val.getDefiningOp()) {
@@ -153,7 +152,7 @@ mlir::Value resolveDoneSignalForValue(mlir::Value val, mlir::Location loc,
   }
 
   // Fallback: use constant deduplication for component operations
-  return getOrCreateConstant(componentOp, builder, 1);
+  return getOrCreateConstant(componentOp, 1);
 }
 
 void updateComponentDoneConnection(circt::calyx::ComponentOp comp,
@@ -187,62 +186,34 @@ void updateComponentDoneConnection(circt::calyx::ComponentOp comp,
   wiresBuilder.create<AssignOp>(loc, donePort, newDone);
 }
 
-mlir::Value getOrCreateConstant(mlir::Operation *parentOp,
-                                mlir::ConversionPatternRewriter &rewriter,
-                                int64_t value,
+// Example usage of the generic getOrCreateOperation template for SeqMemoryOp
+// deduplication This demonstrates how to use the template for any operation
+// type:
+//
+// auto memOp = getOrCreateOperation<calyx::SeqMemoryOp>(
+//     componentOp.getOperation(),
+//     rewriter,
+//     loc,
+//     [&](calyx::SeqMemoryOp existingMem) -> bool {
+//       // Match criteria: same name and dimensions
+//       return existingMem.getSymName() == expectedMemName &&
+//              existingMem.getSizes() == expectedSizes;
+//     },
+//     [&]() -> calyx::SeqMemoryOp {
+//       // Creator function: create new memory if none matches
+//       return rewriter.create<calyx::SeqMemoryOp>(loc, expectedMemName,
+//       elementWidth, sizes, addrSizes);
+//     }
+// );
+
+/// Unified utility functions implementation
+
+mlir::Value getOrCreateConstant(mlir::Operation *parentOp, int64_t value,
                                 std::optional<unsigned> bitWidth) {
-  // Calculate the actual bit width needed
-  unsigned actualBitWidth = bitWidth.value_or(1); // Default to 1 bit for now
+  // Always set insertion point at the parentOp
+  mlir::OpBuilder builder(parentOp->getContext());
+  builder.setInsertionPoint(parentOp);
 
-  // Get the body block from either func::FuncOp or calyx::ComponentOp
-  mlir::Block *bodyBlock = nullptr;
-  mlir::Location loc = parentOp->getLoc();
-
-  if (auto funcOp = dyn_cast<mlir::func::FuncOp>(parentOp)) {
-    bodyBlock = &funcOp.getBody().front();
-  } else if (auto componentOp = dyn_cast<circt::calyx::ComponentOp>(parentOp)) {
-    bodyBlock = componentOp.getBodyBlock();
-  } else {
-    // Fallback: try to get the first region's first block
-    if (!parentOp->getRegions().empty() && !parentOp->getRegion(0).empty()) {
-      bodyBlock = &parentOp->getRegion(0).front();
-    } else {
-      return nullptr; // Cannot determine body block
-    }
-  }
-
-  if (!bodyBlock) {
-    return nullptr;
-  }
-
-  // Search for existing constant with the same value and bit width in the body
-  for (auto &op : bodyBlock->getOperations()) {
-    if (auto constOp = dyn_cast<hw::ConstantOp>(op)) {
-      // Compare APInt values and bit widths
-      const auto &constValue = constOp.getValue();
-      if (constValue.getBitWidth() == actualBitWidth &&
-          constValue.getZExtValue() == static_cast<uint64_t>(value)) {
-        return constOp.getResult();
-      }
-    }
-  }
-
-  // If constant doesn't exist, create it at the parent operation level
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(bodyBlock);
-
-  // Create the constant with specified bit width using parent's location
-  auto constantOp = rewriter.create<hw::ConstantOp>(
-      loc,
-      rewriter.getIntegerAttr(rewriter.getIntegerType(actualBitWidth), value));
-
-  return constantOp.getResult();
-}
-
-// Overload for regular OpBuilder
-mlir::Value getOrCreateConstant(mlir::Operation *parentOp,
-                                mlir::OpBuilder &builder, int64_t value,
-                                std::optional<unsigned> bitWidth) {
   // Calculate the actual bit width needed
   unsigned actualBitWidth = bitWidth.value_or(1); // Default to 1 bit for now
 
@@ -291,25 +262,38 @@ mlir::Value getOrCreateConstant(mlir::Operation *parentOp,
   return constantOp.getResult();
 }
 
-// Example usage of the generic getOrCreateOperation template for SeqMemoryOp
-// deduplication This demonstrates how to use the template for any operation
-// type:
-//
-// auto memOp = getOrCreateOperation<calyx::SeqMemoryOp>(
-//     componentOp.getOperation(),
-//     rewriter,
-//     loc,
-//     [&](calyx::SeqMemoryOp existingMem) -> bool {
-//       // Match criteria: same name and dimensions
-//       return existingMem.getSymName() == expectedMemName &&
-//              existingMem.getSizes() == expectedSizes;
-//     },
-//     [&]() -> calyx::SeqMemoryOp {
-//       // Creator function: create new memory if none matches
-//       return rewriter.create<calyx::SeqMemoryOp>(loc, expectedMemName,
-//       elementWidth, sizes, addrSizes);
-//     }
-// );
+mlir::Value createReg(mlir::Operation *parentOp, mlir::Type type,
+                      llvm::StringRef name) {
+  mlir::OpBuilder builder(parentOp->getContext());
+  builder.setInsertionPoint(parentOp);
+  mlir::Location loc = parentOp->getLoc();
+
+  // Generate unique name if not provided
+  std::string regName =
+      name.empty() ? ("reg_" + getOpUniqueName(parentOp)) : name.str();
+
+  // Get the bit width from the type
+  unsigned bitWidth = 1;
+  if (auto intType = dyn_cast<mlir::IntegerType>(type)) {
+    bitWidth = intType.getWidth();
+  }
+
+  // Handle different parent operation types
+  if (auto componentOp = dyn_cast<circt::calyx::ComponentOp>(parentOp)) {
+    // Set insertion point to the component body block start
+    builder.setInsertionPointToStart(componentOp.getBodyBlock());
+
+    // Create the register directly in the component body
+    auto regOp = builder.create<circt::calyx::RegisterOp>(
+        loc, builder.getStringAttr(regName), bitWidth);
+    return regOp.getOut();
+  }
+
+  // Fallback for other operation types (function context)
+  auto regOp = builder.create<circt::calyx::RegisterOp>(
+      loc, builder.getStringAttr(regName), bitWidth);
+  return regOp.getOut();
+}
 
 } // namespace lowertocalyx
 } // namespace circt
