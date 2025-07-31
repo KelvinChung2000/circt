@@ -94,9 +94,6 @@ private:
   /// Step 7b: Apply control flow wrapping for calyx.seq/calyx.par
   LogicalResult applyControlFlowWrapping(ModuleOp moduleOp);
 
-  /// Step 8a: Connect clock and reset signals to appropriate component ports
-  LogicalResult applyClockResetConnections(ModuleOp moduleOp);
-
   /// Step 8b: Validate that all operations have been converted
   LogicalResult validateConversion(ModuleOp moduleOp);
 
@@ -160,16 +157,10 @@ void LowerToCalyxPass::runOnOperation() {
   //   return;
   // }
 
-  // if (failed(applyControlFlowWrapping(moduleOp))) {
-  //   signalPassFailure();
-  //   return;
-  // }
-
-  // // Step 8a: Connect clock and reset signals to appropriate ports
-  // if (failed(applyClockResetConnections(moduleOp))) {
-  //   signalPassFailure();
-  //   return;
-  // }
+  if (failed(applyControlFlowWrapping(moduleOp))) {
+    signalPassFailure();
+    return;
+  }
 
   // Step 8b: Validation
   // if (failed(validateConversion(moduleOp))) {
@@ -285,7 +276,7 @@ LogicalResult LowerToCalyxPass::convertBlocksToGroups(ModuleOp moduleOp) {
 
   // Collect blocks to process to avoid iterator invalidation
   SmallVector<Block *> blocksToProcess;
-  controlOp->walk([&](Block *block) {
+  controlOp->walk<WalkOrder::PreOrder>([&](Block *block) {
     if (!block->empty()) {
       blocksToProcess.push_back(block);
     }
@@ -299,59 +290,62 @@ LogicalResult LowerToCalyxPass::convertBlocksToGroups(ModuleOp moduleOp) {
     // Collect non-control operations that should be moved to groups
     SmallVector<Operation *> opsToMove;
     SmallVector<Operation *> groupDoneOps;
+    if (block->empty()) {
+      continue; // Skip empty blocks
+    }
 
-    for (auto &op : *block) {
-      if (!op.hasTrait<calyx::ControlLike>() &&
-          !isa<mlir::func::ReturnOp>(op)) {
+    bool haveDoneOp = false;
+    std::string groupName = "bb" + std::to_string(groupCounter++);
+    auto groupOp =
+        wiresBuilder.create<calyx::GroupOp>(componentOp.getLoc(), groupName);
+
+    Block *groupBodyBlock = groupOp.getBodyBlock();
+    for (auto &op : llvm::make_early_inc_range(*block)) {
+      if (op.hasTrait<calyx::ControlLike>()) {
+        continue;
+      }
+      op.moveBefore(groupBodyBlock, groupBodyBlock->end());
+      if (isa<calyx::GroupDoneOp>(op)) {
+        haveDoneOp = true;
+      }
+    }
+    if (!haveDoneOp) {
+      // Instead of creating a constant done signal, look for the last done
+      // signal in the group
+      Value lastDoneSignal = nullptr;
+
+      // Iterate through the operations in the group to find done signals
+      for (auto &op : groupBodyBlock->getOperations()) {
+        // Skip the GroupDoneOp itself
         if (isa<calyx::GroupDoneOp>(op)) {
-          groupDoneOps.push_back(&op);
+          continue;
+        }
+        // Look for operations that produce done signals
+        if (auto assign = dyn_cast<calyx::AssignOp>(&op)) {
+          lastDoneSignal =
+              resolveDoneSignalForValue(assign.getDest(), componentOp);
         } else {
-          opsToMove.push_back(&op);
+          for (Value result : op.getResults()) {
+            lastDoneSignal = resolveDoneSignalForValue(result, componentOp);
+          }
         }
       }
-    }
 
-    // Only create a group if there are operations to move
-    if (!opsToMove.empty()) {
-      // Create a group for the block operations
-      std::string groupName = "bb" + std::to_string(groupCounter++);
-      auto groupOp =
-          wiresBuilder.create<calyx::GroupOp>(componentOp.getLoc(), groupName);
-
-      Block *groupBodyBlock = groupOp.getBodyBlock();
-
-      // Move all non-control operations to the group body
-      for (auto *op : opsToMove) {
-        op->moveBefore(groupBodyBlock, groupBodyBlock->end());
-      }
-
-      // Move group_done operations to the group body as well
-      for (auto *op : groupDoneOps) {
-        op->moveBefore(groupBodyBlock, groupBodyBlock->end());
-      }
-
-      // If no group_done operations were found, create one
-      // This is needed for simple arithmetic groups that don't have explicit
-      // group_done
-      if (groupDoneOps.empty()) {
-        // Create constant at component level using deduplication helper
-        // At this point, funcOp should already be converted to a
-        // calyx.component
-        OpBuilder componentBuilder(componentOp.getBodyBlock(),
-                                   componentOp.getBodyBlock()->end());
-        auto constOne = getOrCreateConstant(componentOp, 1);
-
-        // Then create group_done in the group
+      if (lastDoneSignal) {
+        // Use the last found done signal for the group done
         OpBuilder groupBuilder(groupBodyBlock, groupBodyBlock->end());
-        groupBuilder.create<calyx::GroupDoneOp>(componentOp.getLoc(), constOne);
+        groupBuilder.create<calyx::GroupDoneOp>(componentOp.getLoc(),
+                                                lastDoneSignal);
+      } else {
+        // No done signals found - mark this group as combinational
+        // In Calyx, combinational groups don't have done signals
+        // We can set the "comb" attribute on the group
+        groupOp->setAttr("comb", mlir::UnitAttr::get(componentOp.getContext()));
       }
-
-      // Insert enable operation at the beginning of the block where ops were
-      // moved from
-      OpBuilder blockBuilder(block, block->begin());
-      blockBuilder.create<calyx::EnableOp>(componentOp.getLoc(),
-                                           groupOp.getSymName());
     }
+    OpBuilder blockBuilder(block, block->begin());
+    blockBuilder.create<calyx::EnableOp>(componentOp.getLoc(),
+                                         groupOp.getSymName());
   }
 
   return success();
@@ -653,73 +647,6 @@ LogicalResult LowerToCalyxPass::applyControlFlowWrapping(ModuleOp moduleOp) {
                                                          &getContext());
 
   return applyPartialConversion(moduleOp, target, std::move(patterns));
-}
-
-LogicalResult LowerToCalyxPass::applyClockResetConnections(ModuleOp moduleOp) {
-  // Walk through all ComponentOp instances in the module
-  for (auto componentOp : moduleOp.getOps<calyx::ComponentOp>()) {
-    // Get the component's clock and reset ports
-    Value clkPort = componentOp.getClkPort();
-    Value resetPort = componentOp.getResetPort();
-
-    if (!clkPort || !resetPort) {
-      // Component doesn't have mandatory clock/reset ports, skip
-      continue;
-    }
-
-    // Find the wires operation to create assignments
-    auto wiresOp = componentOp.getWiresOp();
-    if (!wiresOp) {
-      continue;
-    }
-
-    auto &wiresBlock = wiresOp.getBodyRegion().front();
-    OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
-
-    // Walk through all operations in the component to find primitives that need
-    // clock/reset connections
-    componentOp.walk([&](Operation *op) {
-      // Check for operations that have clock and reset ports
-      // This includes RegisterOp, SeqMemoryOp, and other primitives
-
-      if (auto regOp = dyn_cast<calyx::RegisterOp>(op)) {
-        // RegisterOp has ports: in, write_en, clk, reset, out, done
-        Value regClk = regOp.getClk();
-        Value regReset = regOp.getReset();
-
-        // Create assignments to connect component clk/reset to register
-        // clk/reset
-        wiresBuilder.create<calyx::AssignOp>(regOp.getLoc(), regClk, clkPort);
-        wiresBuilder.create<calyx::AssignOp>(regOp.getLoc(), regReset,
-                                             resetPort);
-      } else if (auto memOp = dyn_cast<calyx::SeqMemoryOp>(op)) {
-        // SeqMemoryOp has clk() and reset() methods
-        Value memClk = memOp.clk();
-        Value memReset = memOp.reset();
-
-        // Create assignments to connect component clk/reset to memory clk/reset
-        wiresBuilder.create<calyx::AssignOp>(memOp.getLoc(), memClk, clkPort);
-        wiresBuilder.create<calyx::AssignOp>(memOp.getLoc(), memReset,
-                                             resetPort);
-      } else if (auto multPipeOp = dyn_cast<calyx::MultPipeLibOp>(op)) {
-        // MultPipeLibOp has 7 results: clk, reset, go, left, right, out, done
-        Value pipeClk = multPipeOp->getResult(0);   // clk
-        Value pipeReset = multPipeOp->getResult(1); // reset
-
-        // Create assignments to connect component clk/reset to pipelined
-        // operation clk/reset
-        wiresBuilder.create<calyx::AssignOp>(multPipeOp.getLoc(), pipeClk,
-                                             clkPort);
-        wiresBuilder.create<calyx::AssignOp>(multPipeOp.getLoc(), pipeReset,
-                                             resetPort);
-      }
-      // Add more primitive types as needed
-      // For other primitives, we would need to check their result structure
-      // and identify which results correspond to clock and reset ports
-    });
-  }
-
-  return success();
 }
 
 } // namespace

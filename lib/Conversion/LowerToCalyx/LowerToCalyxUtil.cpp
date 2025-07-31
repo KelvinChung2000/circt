@@ -150,7 +150,6 @@ mlir::Value resolveDoneSignalForValue(mlir::Value val,
       }
     }
   }
-
   // Fallback: use constant deduplication for component operations
   return getOrCreateConstant(componentOp, 1);
 }
