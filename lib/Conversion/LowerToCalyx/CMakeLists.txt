@@ -14,6 +14,7 @@ add_circt_conversion_library(CIRCTLowerToCalyx
 
   LINK_LIBS PUBLIC
   CIRCTCalyx
+  CIRCTLoopSchedule
   CIRCTSupport
   CIRCTHW
   MLIRArithDialect

@@ -373,8 +373,9 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
                lowertocalyx::ArithTruncIToCalyxPattern,
                lowertocalyx::ArithCmpIToCalyxPattern,
                lowertocalyx::ArithConstantToCalyxPattern,
-               lowertocalyx::ArithSelectToCalyxPattern>(typeConverter,
-                                                        &getContext());
+               lowertocalyx::ArithSelectToCalyxPattern,
+               lowertocalyx::ArithIndexCastToCalyxPattern>(typeConverter,
+                                                           &getContext());
 
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }

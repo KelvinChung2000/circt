@@ -92,7 +92,7 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
         auto use = op.getArgument(i).getUses().begin();
         if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(use->getOwner())) {
           OpBuilder loadBuilder(rewriter.getContext());
-          loadBuilder.setInsertionPointAfter(wiresOp);
+          loadBuilder.setInsertionPointAfter(loadOp);
 
           // TODO: Handle type conversion for address port assignment
           // For now, skip type conversion to get basic structure working
@@ -115,7 +115,7 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
         } else if (auto storeOp =
                        dyn_cast<mlir::memref::StoreOp>(use->getOwner())) {
           OpBuilder storeBuilder(rewriter.getContext());
-          storeBuilder.setInsertionPointAfter(wiresOp);
+          storeBuilder.setInsertionPointAfter(storeOp);
 
           // TODO: Handle type conversion for address port assignment
           // For now, skip type conversion to get basic structure working

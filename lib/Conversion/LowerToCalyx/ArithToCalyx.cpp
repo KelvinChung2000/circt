@@ -12,7 +12,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "LowerToCalyxUtil.h"
+#include "circt/Dialect/Calyx/CalyxLoweringUtils.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
+#include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "convertPattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -70,7 +72,6 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
       *topLevelOp.getFunctionBody().template getOps<calyx::WiresOp>().begin();
 
   // Create the library operation inside the wires operation
-  auto &wiresBlock = wiresOp.getBodyRegion().front();
   OpBuilder componentBuilder(wiresOp);
 
   // Create the appropriate Calyx library operation based on the arith operation
@@ -85,6 +86,7 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
 
   // Create assign operations in the wires section (not in groups)
   // Use the same wiresBlock we created the library operation in
+  auto &wiresBlock = wiresOp.getBodyRegion().front();
   OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
 
   wiresBuilder.create<calyx::AssignOp>(loc, leftPort, lhs);
@@ -401,9 +403,70 @@ template struct ArithComparisonOpToCalyxPattern<mlir::arith::CmpIOp,
 // template struct ArithComparisonOpToCalyxPattern<mlir::arith::CmpFOp,
 // calyx::CompareFOpIEEE754>;
 
-// Explicit template instantiations for special operations
+// Dedicated IndexCast pattern implementation following SCFToCalyx approach
+LogicalResult ArithIndexCastToCalyxPattern::matchAndRewrite(
+    mlir::arith::IndexCastOp op, mlir::arith::IndexCastOp::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+
+  // Follow SCFToCalyx approach exactly
+  Type sourceType = calyx::normalizeType(rewriter, op.getOperand().getType());
+  Type targetType = calyx::normalizeType(rewriter, op.getResult().getType());
+  unsigned targetBits = targetType.getIntOrFloatBitWidth();
+  unsigned sourceBits = sourceType.getIntOrFloatBitWidth();
+
+  if (targetBits == sourceBits) {
+    // Drop the index cast and replace uses of the target value with the source
+    // value.
+    op.getResult().replaceAllUsesWith(op.getOperand());
+  } else {
+    // Create Calyx library operations following the same pattern as other arith
+    // ops
+    auto loc = op.getLoc();
+    std::string symName = getOpUniqueName(op);
+
+    // Create result types for the library operation
+    SmallVector<Type> resultTypes = {calyx::toBitVector(sourceType),
+                                     calyx::toBitVector(targetType)};
+
+    // Find the parent component to create library operations at the component
+    // level
+    func::FuncOp topLevelOp = op->getParentOfType<func::FuncOp>();
+    auto wiresOp =
+        *topLevelOp.getFunctionBody().getOps<calyx::WiresOp>().begin();
+
+    // Create the library operation inside the wires operation
+    OpBuilder componentBuilder(wiresOp);
+    auto &wiresBlock = wiresOp.getBodyRegion().front();
+    OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
+
+    if (sourceBits > targetBits) {
+      // Truncation: use SliceLibOp
+      auto sliceOp = componentBuilder.create<calyx::SliceLibOp>(
+          loc, componentBuilder.getStringAttr(symName), resultTypes);
+
+      wiresBuilder.create<calyx::AssignOp>(loc, sliceOp.getIn(), op.getIn());
+      // Replace uses with the output port (second result)
+      op.getResult().replaceAllUsesWith(sliceOp.getOut());
+    } else {
+      // Extension: use PadLibOp
+      auto padOp = componentBuilder.create<calyx::PadLibOp>(
+          loc, componentBuilder.getStringAttr(symName), resultTypes);
+
+      wiresBuilder.create<calyx::AssignOp>(loc, padOp.getIn(), op.getIn());
+      // Replace uses with the output port (second result)
+      op.getResult().replaceAllUsesWith(padOp.getOut());
+    }
+  }
+  rewriter.eraseOp(op);
+  return success();
+}
+
+// Explicit template instantiations for special operations (after
+// specializations)
 template struct ArithSpecialOpToCalyxPattern<mlir::arith::ConstantOp>;
 template struct ArithSpecialOpToCalyxPattern<mlir::arith::SelectOp>;
+// Note: IndexCast uses template specialization above, no explicit instantiation
+// needed
 
 } // namespace lowertocalyx
 } // namespace circt

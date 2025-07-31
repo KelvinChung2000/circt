@@ -145,6 +145,13 @@ using ArithConstantToCalyxPattern =
     ArithSpecialOpToCalyxPattern<mlir::arith::ConstantOp>;
 using ArithSelectToCalyxPattern =
     ArithSpecialOpToCalyxPattern<mlir::arith::SelectOp>;
+// Dedicated IndexCast pattern class
+struct ArithIndexCastToCalyxPattern : mlir::OpConversionPattern<mlir::arith::IndexCastOp> {
+  using mlir::OpConversionPattern<mlir::arith::IndexCastOp>::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::arith::IndexCastOp op, mlir::arith::IndexCastOp::Adaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override;
+};
 
 // Function patterns
 struct FuncFuncToCalyxPattern : mlir::OpConversionPattern<mlir::func::FuncOp> {

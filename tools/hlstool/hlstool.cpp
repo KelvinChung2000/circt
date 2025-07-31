@@ -431,7 +431,7 @@ static LogicalResult doHLSFlowCalyx(
   });
   // Lower to Calyx
   addIRLevel(IRLevel::Core, [&]() {
-    pm.addPass(circt::createSCFToCalyxPass(topLevelFunction));
+    pm.addPass(circt::createLowerToCalyxPass(topLevelFunction));
   });
 
   // Run Calyx transforms

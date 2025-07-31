@@ -33,9 +33,35 @@ std::string getOpUniqueName(mlir::Operation *op);
 namespace circt {
 namespace lowertocalyx {
 
+// Helper function to check if a region contains only side-effect-free
+// operations
+static bool hasNoSideEffects(Region &region) {
+  for (auto &block : region) {
+    for (auto &op : block) {
+      // Skip yield operations as they're terminators
+      if (isa<mlir::scf::YieldOp>(op)) {
+        continue;
+      }
+
+      // Check if operation has side effects
+      if (!isMemoryEffectFree(&op)) {
+        return false;
+      }
+
+      // Check nested regions recursively
+      for (auto &nestedRegion : op.getRegions()) {
+        if (!hasNoSideEffects(nestedRegion)) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 /// Transform a single SCF If operation to Calyx hardware constructs
 /// This function creates registers, not ops, and assigns directly in the
-/// transformation
+/// transformation. If both branches have no side effects, it uses MuxLibOp.
 LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
                                     OpBuilder &wiresBuilder,
                                     OpBuilder &functionBuilder) {
@@ -66,13 +92,13 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
   functionBuilder.setInsertionPoint(wiresOp);
 
   std::string regName = "reg_" + getOpUniqueName(ifOp);
-  auto calyxRegOp = functionBuilder.create<calyx::RegisterOp>(
+  auto resultReg = functionBuilder.create<calyx::RegisterOp>(
       ifOp.getLoc(), regName, ifResult.getType());
 
-  Value regIn = calyxRegOp.getResult(0);      // reg.in
-  Value regWriteEn = calyxRegOp.getResult(1); // reg.write_en
-  Value regOut = calyxRegOp.getResult(4);     // reg.out
-  Value regDone = calyxRegOp.getResult(5);    // reg.done
+  // Value regIn = resultReg.getResult(0);      // reg.in
+  // Value regWriteEn = resultReg.getResult(1); // reg.write_en
+  // Value regOut = resultReg.getResult(4);     // reg.out
+  // Value regDone = resultReg.getResult(5);    // reg.done
 
   // Find the yield values in then and else regions
   Value thenYieldValue = nullptr;
@@ -110,11 +136,94 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
     return ifOp.emitError("Could not find yield values in scf.if branches");
   }
 
+  // Check if both branches have no side effects - if so, use MuxLibOp
+  // optimization
+  bool thenHasNoSideEffects = hasNoSideEffects(ifOp.getThenRegion());
+  bool elseHasNoSideEffects = hasNoSideEffects(ifOp.getElseRegion());
+
+  if (thenHasNoSideEffects && elseHasNoSideEffects) {
+    // Both branches are side-effect-free, use MuxLibOp instead
+    std::string muxName = "mux_" + getOpUniqueName(ifOp);
+    auto resultType = ifResult.getType();
+
+    // First, move all operations from both regions out of the scf.if
+    OpBuilder builder(ifOp);
+    IRMapping thenMapping, elseMapping;
+
+    // Clone operations from then region (excluding yield)
+    Value thenResult = nullptr;
+    if (!ifOp.getThenRegion().empty()) {
+      auto &thenBlock = ifOp.getThenRegion().front();
+      for (auto &op : llvm::make_early_inc_range(thenBlock)) {
+        if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
+          if (yieldOp.getNumOperands() > 0) {
+            thenResult = thenMapping.lookupOrDefault(yieldOp.getOperand(0));
+            if (!thenResult)
+              thenResult = yieldOp.getOperand(0);
+          }
+          continue; // Don't clone yield
+        }
+        // Clone the operation before the scf.if
+        auto *clonedOp = builder.clone(op, thenMapping);
+        (void)clonedOp; // Mark as used
+      }
+    }
+
+    // Clone operations from else region (excluding yield)
+    Value elseResult = nullptr;
+    if (!ifOp.getElseRegion().empty()) {
+      auto &elseBlock = ifOp.getElseRegion().front();
+      for (auto &op : llvm::make_early_inc_range(elseBlock)) {
+        if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
+          if (yieldOp.getNumOperands() > 0) {
+            elseResult = elseMapping.lookupOrDefault(yieldOp.getOperand(0));
+            if (!elseResult)
+              elseResult = yieldOp.getOperand(0);
+          }
+          continue; // Don't clone yield
+        }
+        // Clone the operation before the scf.if
+        auto *clonedOp = builder.clone(op, elseMapping);
+        (void)clonedOp; // Mark as used
+      }
+    }
+
+    // Create MuxLibOp at function level
+    functionBuilder.setInsertionPoint(wiresOp);
+    auto muxOp = functionBuilder.create<calyx::MuxLibOp>(
+        ifOp.getLoc(), muxName,
+        llvm::SmallVector<mlir::Type>{condition.getType(), resultType,
+                                      resultType, resultType});
+
+    // Set up the mux connections in wires
+    wiresBuilder.setInsertionPointToEnd(wiresOp.getBodyBlock());
+
+    // Connect condition to mux.cond
+    wiresBuilder.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getCond(),
+                                         condition);
+
+    // Connect then value to mux.tru
+    wiresBuilder.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getTru(),
+                                         thenResult);
+
+    // Connect else value to mux.fal
+    wiresBuilder.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getFal(),
+                                         elseResult);
+
+    // Replace all uses of the scf.if result with the mux output
+    ifResult.replaceAllUsesWith(muxOp.getOut());
+
+    // Erase the original scf.if
+    ifOp.erase();
+
+    return success();
+  }
+
   // Create constant 1 for write enable using deduplication
   auto constantOne = getOrCreateConstant(funcOp.getOperation(), 1);
 
   // Replace all uses of the scf.if result with the register output
-  ifResult.replaceAllUsesWith(regOut);
+  ifResult.replaceAllUsesWith(resultReg.getOut());
 
   // Replace yield operations with register assignments and group_done
   // operations Then region
@@ -124,13 +233,13 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
         OpBuilder builder(&op);
         // Create assignment: reg.in = thenYieldValue
-        builder.create<calyx::AssignOp>(op.getLoc(), regIn, thenYieldValue,
-                                        ifOp.getCondition());
+        builder.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
+                                        thenYieldValue, ifOp.getCondition());
         // Create assignment: reg.write_en = 1
-        builder.create<calyx::AssignOp>(op.getLoc(), regWriteEn, constantOne,
-                                        ifOp.getCondition());
+        builder.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
+                                        constantOne, ifOp.getCondition());
         // Create group_done
-        builder.create<calyx::GroupDoneOp>(op.getLoc(), regDone);
+        builder.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
         yieldOp.erase();
       }
     }
@@ -151,13 +260,15 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
         builder.create<calyx::AssignOp>(op.getLoc(), invertedCondition.getIn(),
                                         ifOp.getCondition());
         // Create assignment: reg.in = elseYieldValue
-        builder.create<calyx::AssignOp>(op.getLoc(), regIn, elseYieldValue,
+        builder.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
+                                        elseYieldValue,
                                         invertedCondition.getOut());
         // Create assignment: reg.write_en = 1
-        builder.create<calyx::AssignOp>(op.getLoc(), regWriteEn, constantOne,
+        builder.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
+                                        constantOne,
                                         invertedCondition.getOut());
         // Create group_done
-        builder.create<calyx::GroupDoneOp>(op.getLoc(), regDone);
+        builder.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
         yieldOp.erase();
       }
     }
