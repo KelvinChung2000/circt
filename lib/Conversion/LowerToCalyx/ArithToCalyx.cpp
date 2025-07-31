@@ -69,8 +69,9 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   auto wiresOp =
       *topLevelOp.getFunctionBody().template getOps<calyx::WiresOp>().begin();
 
-  OpBuilder componentBuilder(rewriter.getContext());
-  componentBuilder.setInsertionPoint(wiresOp);
+  // Create the library operation inside the wires operation
+  auto &wiresBlock = wiresOp.getBodyRegion().front();
+  OpBuilder componentBuilder(wiresOp);
 
   // Create the appropriate Calyx library operation based on the arith operation
   // type
@@ -83,8 +84,7 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   Value outPort = libOp.getOut();     // output port
 
   // Create assign operations in the wires section (not in groups)
-  // Find the wires operation and create assignments inside it
-  auto &wiresBlock = wiresOp.getBodyRegion().front();
+  // Use the same wiresBlock we created the library operation in
   OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
 
   wiresBuilder.create<calyx::AssignOp>(loc, leftPort, lhs);
