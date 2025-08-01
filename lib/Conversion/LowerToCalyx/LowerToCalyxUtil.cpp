@@ -22,6 +22,9 @@ namespace circt {
 using namespace calyx;
 namespace lowertocalyx {
 
+// Forward declarations
+mlir::Value getOperationDonePort(mlir::Operation *producerOp);
+
 void moveRegionContents(mlir::Region &sourceRegion, mlir::Region &targetRegion,
                         mlir::ConversionPatternRewriter &rewriter) {
   if (sourceRegion.empty()) {
@@ -171,36 +174,35 @@ mlir::Value trackAssignUsersRecursively(mlir::Value val, mlir::Operation *parent
     // Check if this operation has pipeline or sequential traits
     if (producerOp->hasTrait<calyx::SequentialTrait>() ||
         producerOp->hasTrait<calyx::PipelineTrait>()) {
-      if (auto cellOp = dyn_cast<circt::calyx::CellInterface>(producerOp)) {
-        auto portAttrs = cellOp.portAttributes();
-        auto results = producerOp->getResults();
-
-        // Find the result that corresponds to the done port
-        for (size_t i = 0; i < results.size() && i < portAttrs.size(); ++i) {
-          if (portAttrs[i].contains(donePort)) {
-            return results[i]; // Found pipelined/sequential done signal
-          }
-        }
+      if (auto donePort = getOperationDonePort(producerOp)) {
+        return donePort;
       }
     }
-  }
 
-  // Track all assign operations that use this value
-  for (auto &use : val.getUses()) {
-    auto *userOp = use.getOwner();
-
-    // Check if the user is an assign operation
-    if (auto assignOp = dyn_cast<circt::calyx::AssignOp>(userOp)) {
-      // Get the source value of the assign operation
-      mlir::Value srcVal = assignOp.getSrc();
-
-      // Recursively check the source value's producer
-      // If source is terminal, we have a path to constant/argument
-      if (isTerminalValue(srcVal, parentOp)) {
-        return getOrCreateConstant(parentOp, 1);
-      } else {
-        // Recursively track the source producer
-        return trackAssignUsersRecursively(srcVal, parentOp, visited);
+    // For Calyx operations, find assign operations that feed this operation's inputs
+    if (isa<circt::calyx::ComponentOp>(parentOp)) {
+      auto componentOp = cast<circt::calyx::ComponentOp>(parentOp);
+      auto bodyBlock = componentOp.getBodyBlock();
+      
+      // Find assign operations that target input ports of our producerOp
+      for (auto &op : bodyBlock->getOperations()) {
+        if (auto wiresOp = dyn_cast<circt::calyx::WiresOp>(op)) {
+          for (auto &wireOp : wiresOp.getBodyRegion().front().getOperations()) {
+            if (auto assignOp = dyn_cast<circt::calyx::AssignOp>(wireOp)) {
+              auto dest = assignOp.getDest();
+              
+              // Check if dest is an input port of our producerOp
+              if (dest.getDefiningOp() == producerOp) {
+                // This assign feeds our operation, recursively check its source
+                auto src = assignOp.getSrc();
+                auto srcDone = trackAssignUsersRecursively(src, parentOp, visited);
+                if (srcDone && srcDone.getDefiningOp() && !isa<hw::ConstantOp>(srcDone.getDefiningOp())) {
+                  return srcDone; // Found a non-constant done signal
+                }
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -210,6 +212,24 @@ mlir::Value trackAssignUsersRecursively(mlir::Value val, mlir::Operation *parent
 
 // Helper function to extract done port from pipeline/sequential operations
 mlir::Value getOperationDonePort(mlir::Operation *producerOp) {
+  // For pipeline operations, the done port is typically the last result
+  if (producerOp->hasTrait<calyx::PipelineTrait>()) {
+    auto results = producerOp->getResults();
+    if (!results.empty()) {
+      // For pipelined operations like MultPipeLibOp, done is the last result
+      return results.back();
+    }
+  }
+  
+  // For sequential operations, also check for done port as last result
+  if (producerOp->hasTrait<calyx::SequentialTrait>()) {
+    auto results = producerOp->getResults();
+    if (!results.empty()) {
+      return results.back();
+    }
+  }
+  
+  // Fallback: try CellInterface approach for other operations
   if (auto cellOp = dyn_cast<circt::calyx::CellInterface>(producerOp)) {
     auto portAttrs = cellOp.portAttributes();
     auto results = producerOp->getResults();
@@ -221,6 +241,7 @@ mlir::Value getOperationDonePort(mlir::Operation *producerOp) {
       }
     }
   }
+  
   return nullptr;
 }
 
@@ -240,16 +261,19 @@ mlir::Value createAndGate(mlir::Value leftDone, mlir::Value rightDone,
     return getOrCreateConstant(parentOp, 1);
   }
 
-  OpBuilder compBuilder(parentOp->getContext());
-  compBuilder.setInsertionPoint(parentOp);
-
   calyx::WiresOp wiresOp = *bodyBlock->getOps<calyx::WiresOp>().begin();
   auto &wiresBlock = wiresOp.getBodyRegion().front();
   OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
 
+  // Create the AND gate inside the component, before the wires section
+  OpBuilder compBuilder(parentOp->getContext());
+  compBuilder.setInsertionPoint(wiresOp);
+
+  // AndLibOp has 3 results: left, right, out (all i1 type)
+  SmallVector<Type> andResultTypes = {compBuilder.getI1Type(), compBuilder.getI1Type(), compBuilder.getI1Type()};
   auto andOp = compBuilder.create<calyx::AndLibOp>(
       loc, compBuilder.getStringAttr(getOpUniqueName(producerOp)),
-      compBuilder.getI1Type());
+      andResultTypes);
   wiresBuilder.create<calyx::AssignOp>(loc, andOp.getLeft(), leftDone);
   wiresBuilder.create<calyx::AssignOp>(loc, andOp.getRight(), rightDone);
   return andOp.getOut();
@@ -260,6 +284,7 @@ mlir::Value resolveDoneSignalForValue(mlir::Value val, mlir::Operation *parentOp
   llvm::SmallPtrSet<mlir::Value, 16> visitedValues;
 
   if (auto producerOp = val.getDefiningOp()) {
+    
     // Case 1: Direct pipeline/sequential operation - return its done port
     if (producerOp->hasTrait<calyx::SequentialTrait>() ||
         producerOp->hasTrait<calyx::PipelineTrait>()) {
@@ -271,17 +296,49 @@ mlir::Value resolveDoneSignalForValue(mlir::Value val, mlir::Operation *parentOp
     // Case 2: Binary combinational operation - AND both operand done signals
     if (producerOp->hasTrait<calyx::Combinational>() &&
         producerOp->hasTrait<calyx::BinaryOpTrait>()) {
-      if (producerOp->getNumOperands() >= 2) {
-        llvm::SmallPtrSet<mlir::Value, 16> leftVisited;
-        llvm::SmallPtrSet<mlir::Value, 16> rightVisited;
-        
-        mlir::Value leftDone = trackAssignUsersRecursively(producerOp->getOperand(0), parentOp, leftVisited);
-        mlir::Value rightDone = trackAssignUsersRecursively(producerOp->getOperand(1), parentOp, rightVisited);
-        
-        return createAndGate(leftDone, rightDone, producerOp, parentOp);
-      } else {
-        return getOrCreateConstant(parentOp, 1); // No operands
+      // For Calyx operations, we need to find assign operations that feed the input ports
+      // rather than checking operands directly
+      if (auto componentOp = dyn_cast<circt::calyx::ComponentOp>(parentOp)) {
+        auto wiresOp = componentOp.getWiresOp();
+        if (wiresOp) {
+          // Find the left and right input ports of the binary operation
+          Value leftPort = nullptr, rightPort = nullptr;
+          auto results = producerOp->getResults();
+          
+          // For std_add: results are [left, right, out]  
+          if (results.size() >= 3) {
+            leftPort = results[0];   // left input port
+            rightPort = results[1];  // right input port
+          }
+          
+          if (leftPort && rightPort) {
+            // Find assign operations that target these ports
+            Value leftSource = nullptr, rightSource = nullptr;
+            for (auto &op : wiresOp.getBodyRegion().front().getOperations()) {
+              if (auto assignOp = dyn_cast<circt::calyx::AssignOp>(op)) {
+                if (assignOp.getDest() == leftPort) {
+                  leftSource = assignOp.getSrc();
+                }
+                if (assignOp.getDest() == rightPort) {
+                  rightSource = assignOp.getSrc();
+                }
+              }
+            }
+            
+            if (leftSource && rightSource) {
+              llvm::SmallPtrSet<mlir::Value, 16> leftVisited;
+              llvm::SmallPtrSet<mlir::Value, 16> rightVisited;
+              
+              mlir::Value leftDone = trackAssignUsersRecursively(leftSource, parentOp, leftVisited);
+              mlir::Value rightDone = trackAssignUsersRecursively(rightSource, parentOp, rightVisited);
+              
+              return createAndGate(leftDone, rightDone, producerOp, parentOp);
+            }
+          }
+        }
       }
+      
+      return getOrCreateConstant(parentOp, 1);
     }
 
     // Case 3: Unary combinational operation - track input

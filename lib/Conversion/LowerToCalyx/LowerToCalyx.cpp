@@ -113,20 +113,25 @@ void LowerToCalyxPass::runOnOperation() {
 
   // Step 1: Add wires section and wrap function body in control op
   // (scaffolding)
-  SmallVector<mlir::func::FuncOp> functionsToProcess;
-  for (auto funcOp : moduleOp.getOps<mlir::func::FuncOp>()) {
-    if (shouldProcessFunction(funcOp)) {
-      functionsToProcess.push_back(funcOp);
-    }
+  // SmallVector<mlir::func::FuncOp> functionsToProcess;
+  // for (auto funcOp : moduleOp.getOps<mlir::func::FuncOp>()) {
+  //   if (shouldProcessFunction(funcOp)) {
+  //     functionsToProcess.push_back(funcOp);
+  //   }
+  // }
+
+  if (moduleOp.getOps<mlir::func::FuncOp>().empty()) {
+    return; // Nothing to process
   }
 
   // Process each function with scaffolding
-  for (auto funcOp : functionsToProcess) {
+  for (auto funcOp : moduleOp.getOps<mlir::func::FuncOp>()) {
     if (failed(scaffoldCalyxStructure(funcOp))) {
       signalPassFailure();
       return;
     }
   }
+
   // Step 5: Convert arith operations to equivalent std ops (patterns)
   if (failed(applyArithPatterns(moduleOp))) {
     signalPassFailure();
@@ -509,7 +514,28 @@ LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
   patterns.add<lowertocalyx::FuncReturnToCalyxPattern>(typeConverter,
                                                        &getContext());
 
-  return applyPartialConversion(moduleOp, target, std::move(patterns));
+  if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
+    return failure();
+  }
+
+  auto componentOps = moduleOp.getOps<calyx::ComponentOp>();
+  if (std::distance(componentOps.begin(), componentOps.end()) == 1) {
+    calyx::ComponentOp componentOp = *componentOps.begin();
+    componentOp->setAttr("toplevel", UnitAttr::get(moduleOp.getContext()));
+  } else {
+    Operation *topLevelComponent =
+        SymbolTable::lookupSymbolIn(moduleOp, topLevelFunctionOpt);
+    if (!topLevelComponent) {
+      moduleOp.emitError("Top-level component not found: ")
+          << topLevelFunctionOpt;
+      return failure();
+    }
+
+    topLevelComponent->setAttr("toplevel",
+                               UnitAttr::get(moduleOp.getContext()));
+  }
+
+  return success();
 }
 
 LogicalResult LowerToCalyxPass::validateConversion(ModuleOp moduleOp) {

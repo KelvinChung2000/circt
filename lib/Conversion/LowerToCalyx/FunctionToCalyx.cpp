@@ -240,7 +240,6 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
   // Create the component operation
   auto componentOp = rewriter.create<calyx::ComponentOp>(
       loc, rewriter.getStringAttr(op.getName()), ports);
-
   // Get the function's block
   Block *funcBlock = &op.getBody().front();
 
