@@ -67,9 +67,9 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
 
   // Find the parent component to create library operations at the component
   // level
-  func::FuncOp topLevelOp = op->template getParentOfType<func::FuncOp>();
-  auto wiresOp =
-      *topLevelOp.getFunctionBody().template getOps<calyx::WiresOp>().begin();
+  calyx::ComponentOp topLevelOp =
+      op->template getParentOfType<calyx::ComponentOp>();
+  auto wiresOp = topLevelOp.getWiresOp();
 
   // Create the library operation inside the wires operation
   OpBuilder componentBuilder(wiresOp);
@@ -134,9 +134,8 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   SmallVector<Type> resultTypes = {i1Type,     i1Type,     i1Type, resultType,
                                    resultType, resultType, i1Type};
 
-  auto topLevelOp = op->template getParentOfType<func::FuncOp>();
-  auto wiresOp =
-      *topLevelOp.getFunctionBody().template getOps<calyx::WiresOp>().begin();
+  auto topLevelOp = op->template getParentOfType<calyx::ComponentOp>();
+  auto wiresOp = topLevelOp.getWiresOp();
 
   OpBuilder componentBuilder(rewriter.getContext());
   componentBuilder.setInsertionPoint(wiresOp);
@@ -157,8 +156,13 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
 
   wiresBuilder.create<calyx::AssignOp>(loc, leftPort, lhs);
   wiresBuilder.create<calyx::AssignOp>(loc, rightPort, rhs);
-  auto true_value = getOrCreateConstant(topLevelOp, 1);
-  rewriter.create<calyx::AssignOp>(loc, libOp.getGo(), true_value);
+
+  // Resolve the go signal based on the done signals of the operands
+  Value leftDone = resolveDoneSignalForValue(lhs, topLevelOp);
+  Value rightDone = resolveDoneSignalForValue(rhs, topLevelOp);
+  Value goSignal = createAndGate(leftDone, rightDone, op, topLevelOp);
+
+  rewriter.create<calyx::AssignOp>(loc, libOp.getGo(), goSignal);
 
   // Replace the original arith operation result with the library operation
   // output
@@ -430,9 +434,8 @@ LogicalResult ArithIndexCastToCalyxPattern::matchAndRewrite(
 
     // Find the parent component to create library operations at the component
     // level
-    func::FuncOp topLevelOp = op->getParentOfType<func::FuncOp>();
-    auto wiresOp =
-        *topLevelOp.getFunctionBody().getOps<calyx::WiresOp>().begin();
+    calyx::ComponentOp topLevelOp = op->getParentOfType<calyx::ComponentOp>();
+    auto wiresOp = topLevelOp.getWiresOp();
 
     // Create the library operation inside the wires operation
     OpBuilder componentBuilder(wiresOp);

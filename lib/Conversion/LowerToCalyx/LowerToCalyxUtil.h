@@ -39,6 +39,10 @@ std::string getOpUniqueName(mlir::Operation *op);
 mlir::Value resolveDoneSignalForValue(mlir::Value val,
                                       mlir::Operation *componentOp);
 
+/// Creates an AND gate to combine two done signals
+mlir::Value createAndGate(mlir::Value leftDone, mlir::Value rightDone,
+                         mlir::Operation *requestingOp, mlir::Operation *parentOp);
+
 /// Updates the component's done port connection with the provided done signal.
 /// This function finds the component's done port and creates an assignment
 /// to connect it to the new done signal, replacing any existing connection.

@@ -49,4 +49,5 @@ target_link_libraries(hlstool
   MLIRTransforms
   MLIRSCFToControlFlow
   MLIRSCFTransforms
+  MLIRLinalgTransforms
   )

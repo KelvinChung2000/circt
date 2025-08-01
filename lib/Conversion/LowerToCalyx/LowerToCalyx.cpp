@@ -82,8 +82,11 @@ private:
   /// Step 5: Apply memory patterns using the separated pattern classes
   LogicalResult applyMemoryPatterns(ModuleOp moduleOp);
 
-  /// Step 6: Apply complete function to component conversion (final step)
-  LogicalResult applyCompleteFunctionConversion(ModuleOp moduleOp);
+  /// Step 6a: Apply function signature to component conversion
+  LogicalResult applyFuncSignatureConversion(ModuleOp moduleOp);
+
+  /// Step 6b: Apply return operation conversion
+  LogicalResult applyReturnConversion(ModuleOp moduleOp);
 
   /// Step 7a: Apply empty group optimization before wrapping
   LogicalResult applyEmptyGroupOptimization(ModuleOp moduleOp);
@@ -129,21 +132,28 @@ void LowerToCalyxPass::runOnOperation() {
     }
   }
 
-  // Step 5: Convert arith operations to equivalent std ops (patterns)
-  if (failed(applyArithPatterns(moduleOp))) {
+  // Step 2: Convert function signatures to components (first part of function
+  // conversion)
+  if (failed(applyFuncSignatureConversion(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 4: Convert memref operations BEFORE arithmetic (to establish proper
+  // Step 3: Convert memref operations BEFORE arithmetic (to establish proper
   // value dependencies)
   if (failed(applyMemoryPatterns(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 3: Convert function to component (patterns) - After scaffolding
-  if (failed(applyCompleteFunctionConversion(moduleOp))) {
+  // Step 4: Convert arith operations to equivalent std ops (patterns)
+  if (failed(applyArithPatterns(moduleOp))) {
+    signalPassFailure();
+    return;
+  }
+
+  // Step 5: Convert return operations (second part of function conversion)
+  if (failed(applyReturnConversion(moduleOp))) {
     signalPassFailure();
     return;
   }
@@ -467,7 +477,7 @@ LowerToCalyxPass::applyIndexConversionPatterns(ModuleOp moduleOp) {
 }
 
 LogicalResult
-LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
+LowerToCalyxPass::applyFuncSignatureConversion(ModuleOp moduleOp) {
   ConversionTarget target(getContext());
   target.addLegalDialect<calyx::CalyxDialect>();
   target
@@ -479,8 +489,6 @@ LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
 
   // Mark function operations as illegal
   target.addIllegalOp<mlir::func::FuncOp>();
-  // Mark func.return as illegal so it gets converted
-  // target.addIllegalOp<mlir::func::ReturnOp>();
 
   // Set up type converter with complete type conversion including memref
   // removal
@@ -495,17 +503,15 @@ LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
   typeConverter.addConversion([](MemRefType) -> Type { return nullptr; });
 
   RewritePatternSet patterns(&getContext());
-  // Add complete function conversion pattern
+  // Add function signature conversion pattern only
   patterns.add<lowertocalyx::FuncFuncToCalyxPattern>(typeConverter,
                                                      &getContext());
-  // Add return conversion pattern
-  patterns.add<lowertocalyx::FuncReturnToCalyxPattern>(typeConverter,
-                                                       &getContext());
 
   if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
     return failure();
   }
 
+  // Set toplevel attribute after function conversion
   auto componentOps = moduleOp.getOps<calyx::ComponentOp>();
   if (std::distance(componentOps.begin(), componentOps.end()) == 1) {
     calyx::ComponentOp componentOp = *componentOps.begin();
@@ -524,6 +530,39 @@ LowerToCalyxPass::applyCompleteFunctionConversion(ModuleOp moduleOp) {
   }
 
   return success();
+}
+
+LogicalResult LowerToCalyxPass::applyReturnConversion(ModuleOp moduleOp) {
+  ConversionTarget target(getContext());
+  target.addLegalDialect<calyx::CalyxDialect>();
+  target
+      .addLegalDialect<arith::ArithDialect, comb::CombDialect, hw::HWDialect>();
+
+  // Allow memref operations during return conversion - they should be converted
+  // by now
+  target.addLegalDialect<mlir::memref::MemRefDialect>();
+
+  // Mark func.return as illegal so it gets converted
+  target.addIllegalOp<mlir::func::ReturnOp>();
+
+  // Set up type converter with complete type conversion including memref
+  // removal
+  TypeConverter typeConverter;
+  typeConverter.addConversion([](Type type) -> Type {
+    if (type.isIndex()) {
+      return IntegerType::get(type.getContext(), 32);
+    }
+    return type;
+  });
+  // memref args are removed from signature and become internal memory
+  typeConverter.addConversion([](MemRefType) -> Type { return nullptr; });
+
+  RewritePatternSet patterns(&getContext());
+  // Add return conversion pattern only
+  patterns.add<lowertocalyx::FuncReturnToCalyxPattern>(typeConverter,
+                                                       &getContext());
+
+  return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 
 LogicalResult LowerToCalyxPass::validateConversion(ModuleOp moduleOp) {

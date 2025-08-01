@@ -18,6 +18,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
@@ -418,11 +420,12 @@ static LogicalResult doHLSFlowCalyx(
 
   // Lower to only SCF abstractions
   addIRLevel(IRLevel::PreCompile, [&]() {
+    pm.addPass(mlir::createConvertLinalgToAffineLoopsPass());
     pm.addPass(mlir::createLowerAffinePass());
     pm.addPass(circt::createFlattenMemRefPass());
     pm.addPass(mlir::createLoopInvariantSubsetHoistingPass());
     pm.addPass(mlir::createLoopInvariantCodeMotionPass());
-    pm.addPass(mlir::createForToWhileLoopPass());
+    // pm.addPass(mlir::createForToWhileLoopPass());
     pm.addPass(mlir::createSROA());
     pm.addPass(mlir::createSCCPPass());
     pm.addPass(mlir::createCSEPass());
@@ -641,6 +644,7 @@ int main(int argc, char **argv) {
   registry.insert<mlir::arith::ArithDialect>();
   registry.insert<mlir::cf::ControlFlowDialect>();
   registry.insert<mlir::scf::SCFDialect>();
+  registry.insert<mlir::linalg::LinalgDialect>();
 
   // Register MLIR passes.
   mlir::registerCSEPass();

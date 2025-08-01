@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -524,18 +525,137 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
     forResult = forOp.getResult(0);
   }
 
+  // Get block arguments from the for loop body
+  Value inductionVar;
+  llvm::SmallVector<Value> iterationArgs;
+  if (!forOp.getRegion().empty() && !forOp.getRegion().front().getArguments().empty()) {
+    auto &forBlock = forOp.getRegion().front();
+    auto blockArgs = forBlock.getArguments();
+    
+    // First argument is always the induction variable
+    if (!blockArgs.empty()) {
+      inductionVar = blockArgs[0];
+    }
+    
+    // Remaining arguments are iteration arguments (iter_args)
+    for (unsigned i = 1; i < blockArgs.size(); ++i) {
+      iterationArgs.push_back(blockArgs[i]);
+    }
+  }
+
+  // Determine bit width for constants - handle index type by using 32-bit default
+  unsigned bitWidth = 32; // Default for index type
+  if (inductionVar) {
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(inductionVar.getType())) {
+      bitWidth = intType.getWidth();
+    }
+  }
+
+  // Find the wires operation for register creation
+  auto &entryBlock = funcOp.front();
+  auto wiresOps = entryBlock.getOps<calyx::WiresOp>();
+  if (wiresOps.empty()) {
+    return forOp.emitError("No WiresOp found in function");
+  }
+  auto wiresOp = *wiresOps.begin();
+
+  // Create a counter register to replace the induction variable
+  Value counterReg;
+  if (inductionVar) {
+    functionBuilder.setInsertionPoint(wiresOp);
+
+    // Create a counter register with the same type as the induction variable
+    std::string counterName = "for_counter_" + getOpUniqueName(forOp);
+    auto counterRegOp = functionBuilder.create<calyx::RegisterOp>(
+        forOp.getLoc(), counterName, inductionVar.getType());
+    counterReg = counterRegOp.getOut();
+    
+    // llvm::errs() << "Created counter register with type: " << counterReg.getType() << "\n";
+
+    // We'll handle counter initialization in a separate initialization group
+    // rather than continuous assignment to avoid conflicts
+  }
+
+  // Create registers for all iteration arguments
+  llvm::SmallVector<Value> iterArgRegs;
+  for (unsigned i = 0; i < iterationArgs.size(); ++i) {
+    functionBuilder.setInsertionPoint(wiresOp);
+    
+    std::string iterArgName = "for_iter_arg_" + std::to_string(i) + "_" + getOpUniqueName(forOp);
+    auto iterArgRegOp = functionBuilder.create<calyx::RegisterOp>(
+        forOp.getLoc(), iterArgName, iterationArgs[i].getType());
+    iterArgRegs.push_back(iterArgRegOp.getOut());
+
+    // Store the initial value - we'll handle initialization differently
+    // since we can't have continuous assignments and conditional assignments
+    // to the same register
+  }
+
   // Replace with calyx.repeat
   OpBuilder builder(forOp);
+  
+  // Initialize counter register before the repeat
+  if (counterReg && inductionVar) {
+    auto initConstant = getOrCreateConstant(funcOp.getOperation(), lbValue, bitWidth);
+    auto counterRegOp = counterReg.getDefiningOp<calyx::RegisterOp>();
+    if (counterRegOp) {
+      builder.create<calyx::AssignOp>(
+          forOp.getLoc(), counterRegOp.getIn(), initConstant);
+      builder.create<calyx::AssignOp>(
+          forOp.getLoc(), counterRegOp.getWriteEn(),
+          getOrCreateConstant(funcOp.getOperation(), 1, 1));
+    }
+  }
+
+  // Initialize iteration argument registers before the repeat
+  auto initArgs = forOp.getInitArgs();
+  for (unsigned i = 0; i < iterArgRegs.size() && i < initArgs.size(); ++i) {
+    auto iterArgRegOp = iterArgRegs[i].getDefiningOp<calyx::RegisterOp>();
+    if (iterArgRegOp) {
+      builder.create<calyx::AssignOp>(
+          forOp.getLoc(), iterArgRegOp.getIn(), initArgs[i]);
+      builder.create<calyx::AssignOp>(
+          forOp.getLoc(), iterArgRegOp.getWriteEn(),
+          getOrCreateConstant(funcOp.getOperation(), 1, 1));
+    }
+  }
+
   auto calyxRepeatOp = builder.create<calyx::RepeatOp>(
       forOp.getLoc(), static_cast<uint32_t>(count));
 
-  // Move the body region contents to the new RepeatOp
+  // Do all replacements FIRST, then do all moves
   auto &forRegion = forOp.getRegion();
   if (!forRegion.empty()) {
     auto &forBlock = forRegion.front();
     auto &repeatBlock = calyxRepeatOp.getBodyRegion().front();
 
-    // Move all operations except the yield
+    // STEP 1: Replace all uses of block arguments with their corresponding registers
+    // Do this BEFORE moving any operations to avoid use-after-move issues
+    
+    // Replace induction variable with counter register
+    if (inductionVar && counterReg) {
+      replaceAllUsesInRegionWith(inductionVar, counterReg, forRegion);
+    }
+    
+    // Replace all iteration arguments with their corresponding registers
+    for (unsigned i = 0; i < iterationArgs.size(); ++i) {
+      if (i < iterArgRegs.size()) {
+        replaceAllUsesInRegionWith(iterationArgs[i], iterArgRegs[i], forRegion);
+      }
+    }
+
+    // STEP 2: Extract yield values before moving operations (for iteration arg updates)
+    llvm::SmallVector<Value> yieldValues;
+    for (auto &op : forBlock) {
+      if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
+        for (unsigned i = 0; i < yieldOp.getNumOperands(); ++i) {
+          yieldValues.push_back(yieldOp.getOperand(i));
+        }
+        break;
+      }
+    }
+
+    // STEP 3: Now it's safe to move all operations except the yield
     for (auto &op : llvm::make_early_inc_range(forBlock)) {
       if (isa<mlir::scf::YieldOp>(op)) {
         op.erase(); // Remove yield as Calyx repeat doesn't need it
@@ -543,27 +663,84 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
       }
       op.moveBefore(&repeatBlock, repeatBlock.end());
     }
+
+    // Add update logic at the end of repeat body
+    OpBuilder repeatBuilder(&repeatBlock, repeatBlock.end());
+    
+    // Update iteration argument registers with yield values
+    for (unsigned i = 0; i < iterArgRegs.size() && i < yieldValues.size(); ++i) {
+      auto iterArgRegOp = iterArgRegs[i].getDefiningOp<calyx::RegisterOp>();
+      if (iterArgRegOp && yieldValues[i]) {
+        // Update iteration argument register with yield value
+        repeatBuilder.create<calyx::AssignOp>(
+            forOp.getLoc(), iterArgRegOp.getIn(), yieldValues[i]);
+        repeatBuilder.create<calyx::AssignOp>(
+            forOp.getLoc(), iterArgRegOp.getWriteEn(),
+            getOrCreateConstant(funcOp.getOperation(), 1, 1));
+      }
+    }
+    
+    // If we created a counter, add increment logic at the end of repeat body
+    if (counterReg && inductionVar) {
+      // Create step constant using getOrCreateConstant
+      auto stepConstantValue = getOrCreateConstant(funcOp.getOperation(), stepValue, bitWidth);
+      
+      // Create add operation for counter increment
+      // Need to create AddLibOp as a component-level operation
+      auto componentOp = forOp->getParentOfType<calyx::ComponentOp>();
+      if (componentOp) {
+        auto wiresOp = componentOp.getWiresOp();
+        OpBuilder componentBuilder(wiresOp);
+        
+        std::string addOpName = "for_counter_add_" + getOpUniqueName(forOp);
+        SmallVector<Type> addResultTypes = {inductionVar.getType(), inductionVar.getType(), inductionVar.getType()};
+        // Create AddLibOp for counter increment
+        auto addOp = componentBuilder.create<calyx::AddLibOp>(
+            forOp.getLoc(), componentBuilder.getStringAttr(addOpName), addResultTypes);
+        
+        // Connect the add operation inputs in wires
+        auto &wiresBlock = wiresOp.getBodyRegion().front();
+        OpBuilder addWiresBuilder(&wiresBlock, wiresBlock.end());
+        addWiresBuilder.create<calyx::AssignOp>(forOp.getLoc(), addOp.getLeft(), counterReg);
+        addWiresBuilder.create<calyx::AssignOp>(forOp.getLoc(), addOp.getRight(), stepConstantValue);
+        
+        // Assign the incremented value back to the counter register in the repeat body
+        auto counterRegOp = counterReg.getDefiningOp<calyx::RegisterOp>();
+        if (counterRegOp) {
+          // Make sure we're using the correct addOp output (should be index type)
+          repeatBuilder.create<calyx::AssignOp>(
+              forOp.getLoc(), counterRegOp.getIn(), addOp.getOut());
+          repeatBuilder.create<calyx::AssignOp>(
+              forOp.getLoc(), counterRegOp.getWriteEn(),
+              getOrCreateConstant(funcOp.getOperation(), 1, 1));
+        }
+      }
+    }
   }
 
-  // If the for loop had results, we need to handle them
-  // For now, we'll create a placeholder - this might need more sophisticated
-  // handling
-  if (forResult) {
-    // Find the wires operation and set insertion point before it
-    auto &entryBlock = funcOp.front();
-    auto wiresOps = entryBlock.getOps<calyx::WiresOp>();
-    if (!wiresOps.empty()) {
-      auto wiresOp = *wiresOps.begin();
-      functionBuilder.setInsertionPoint(wiresOp);
+  // If the for loop had results, replace them with the final iteration argument register values
+  for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
+    auto forResult = forOp.getResult(i);
+    
+    // The for loop result corresponds to the final value of the i-th iteration argument
+    if (i < iterArgRegs.size()) {
+      // Replace all uses of the for result with the iteration argument register output
+      forResult.replaceAllUsesWith(iterArgRegs[i]);
+    } else {
+      // Fallback: create a temporary register if we don't have enough iter arg registers
+      auto &entryBlock = funcOp.front();
+      auto wiresOps = entryBlock.getOps<calyx::WiresOp>();
+      if (!wiresOps.empty()) {
+        auto wiresOp = *wiresOps.begin();
+        functionBuilder.setInsertionPoint(wiresOp);
+      }
+
+      std::string regName = "for_result_" + std::to_string(i) + "_" + getOpUniqueName(forOp);
+      auto resultReg = functionBuilder.create<calyx::RegisterOp>(
+          forOp.getLoc(), regName, forResult.getType());
+
+      forResult.replaceAllUsesWith(resultReg.getOut());
     }
-
-    // Create a temporary register to hold the result
-    std::string regName = "for_result_" + getOpUniqueName(forOp);
-    auto resultReg = functionBuilder.create<calyx::RegisterOp>(
-        forOp.getLoc(), regName, forResult.getType());
-
-    // Replace all uses of the for result with the register output
-    forResult.replaceAllUsesWith(resultReg.getOut());
   }
 
   // Erase the original for loop
