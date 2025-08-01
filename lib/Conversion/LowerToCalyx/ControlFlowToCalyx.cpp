@@ -301,102 +301,6 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
   return success();
 }
 
-template <>
-LogicalResult ScfToCalyxPattern<mlir::scf::ForOp>::matchAndRewrite(
-    mlir::scf::ForOp op, mlir::scf::ForOp::Adaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-  // Check if this is a constant-bound for loop that can be converted to repeat
-  if (auto lbConstant =
-          op.getLowerBound().getDefiningOp<mlir::arith::ConstantOp>()) {
-    if (auto ubConstant =
-            op.getUpperBound().getDefiningOp<mlir::arith::ConstantOp>()) {
-      if (auto stepConstant =
-              op.getStep().getDefiningOp<mlir::arith::ConstantOp>()) {
-        // Extract constant values
-        auto lbIntAttr =
-            mlir::dyn_cast<mlir::IntegerAttr>(lbConstant.getValue());
-        auto ubIntAttr =
-            mlir::dyn_cast<mlir::IntegerAttr>(ubConstant.getValue());
-        auto stepIntAttr =
-            mlir::dyn_cast<mlir::IntegerAttr>(stepConstant.getValue());
-
-        if (!lbIntAttr || !ubIntAttr || !stepIntAttr) {
-          return rewriter.notifyMatchFailure(
-              op, "non-integer constant bounds in for loop");
-        }
-
-        auto lbValue = lbIntAttr.getInt();
-        auto ubValue = ubIntAttr.getInt();
-        auto stepValue = stepIntAttr.getInt();
-
-        // Calculate iteration count
-        if (stepValue > 0 && ubValue > lbValue) {
-          int64_t count = (ubValue - lbValue + stepValue - 1) / stepValue;
-
-          // Create a Calyx RepeatOp
-          auto calyxRepeatOp = rewriter.create<calyx::RepeatOp>(
-              op.getLoc(), static_cast<uint32_t>(count));
-
-          // Move the body region contents to the new RepeatOp
-          rewriter.inlineRegionBefore(op.getRegion(),
-                                      calyxRepeatOp.getBodyRegion(),
-                                      calyxRepeatOp.getBodyRegion().begin());
-
-          // Replace the original ForOp with the new Calyx RepeatOp
-          rewriter.eraseOp(op);
-
-          return success();
-        }
-      }
-    }
-  }
-
-  // For non-constant bounds, mark as not implemented
-  return rewriter.notifyMatchFailure(
-      op, "dynamic for loops not implemented - only constant-bound for loops "
-          "can be converted to calyx.repeat");
-}
-
-template <>
-LogicalResult ScfToCalyxPattern<mlir::scf::WhileOp>::matchAndRewrite(
-    mlir::scf::WhileOp op, mlir::scf::WhileOp::Adaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-  // Get the condition from the before region
-  Block *beforeBlock =
-      op.getBefore().getBlocks().empty() ? nullptr : &op.getBefore().front();
-  if (!beforeBlock) {
-    return rewriter.notifyMatchFailure(op, "while op has no before region");
-  }
-
-  // Find the condition operation in the before block
-  Value condition = nullptr;
-  for (auto &beforeOp : beforeBlock->getOperations()) {
-    if (auto condOp = dyn_cast<mlir::scf::ConditionOp>(beforeOp)) {
-      condition = condOp.getCondition();
-      break;
-    }
-  }
-  if (!condition) {
-    return rewriter.notifyMatchFailure(op,
-                                       "could not find condition in while op");
-  }
-
-  // Create a new Calyx WhileOp with the condition
-  auto calyxWhileOp =
-      rewriter.create<calyx::WhileOp>(op.getLoc(), condition, nullptr);
-
-  // Move the after region (body) contents to the new WhileOp
-  if (!op.getAfter().empty()) {
-    rewriter.inlineRegionBefore(op.getAfter(), calyxWhileOp.getBodyRegion(),
-                                calyxWhileOp.getBodyRegion().begin());
-  }
-
-  // Replace the original WhileOp with the new Calyx WhileOp
-  rewriter.eraseOp(op);
-
-  return success();
-}
-
 // Helper function to check if a group only contains done signals
 static bool groupOnlyHasDone(calyx::GroupOp groupOp) {
   auto *groupBlock = groupOp.getBodyBlock();
@@ -572,65 +476,160 @@ LogicalResult EmptyGroupOptimizationPattern::matchAndRewrite(
   return success();
 }
 
-template <>
-LogicalResult ScfToCalyxPattern<mlir::scf::YieldOp>::matchAndRewrite(
-    mlir::scf::YieldOp op, mlir::scf::YieldOp::Adaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-  // For yield operations, we typically just erase them since Calyx control flow
-  // operations handle termination automatically. The operands (if any) are
-  // handled by the parent control flow operation.
+/// Transform a SCF For operation to Calyx hardware constructs
+/// This function creates registers and hardware for constant-bound for loops
+LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
+                                     OpBuilder &wiresBuilder,
+                                     OpBuilder &functionBuilder) {
+  // Check if this is a constant-bound for loop
+  auto lbConstant =
+      forOp.getLowerBound().getDefiningOp<mlir::arith::ConstantOp>();
+  auto ubConstant =
+      forOp.getUpperBound().getDefiningOp<mlir::arith::ConstantOp>();
+  auto stepConstant = forOp.getStep().getDefiningOp<mlir::arith::ConstantOp>();
 
-  // In some cases, we might need to handle yield operands differently based on
-  // the parent operation context, but for now, we'll simply erase the yield.
-  rewriter.eraseOp(op);
+  if (!lbConstant || !ubConstant || !stepConstant) {
+    return forOp.emitError("Only constant-bound for loops are supported");
+  }
+
+  // Extract constant values
+  auto lbIntAttr = mlir::dyn_cast<mlir::IntegerAttr>(lbConstant.getValue());
+  auto ubIntAttr = mlir::dyn_cast<mlir::IntegerAttr>(ubConstant.getValue());
+  auto stepIntAttr = mlir::dyn_cast<mlir::IntegerAttr>(stepConstant.getValue());
+
+  if (!lbIntAttr || !ubIntAttr || !stepIntAttr) {
+    return forOp.emitError("Non-integer constant bounds in for loop");
+  }
+
+  auto lbValue = lbIntAttr.getInt();
+  auto ubValue = ubIntAttr.getInt();
+  auto stepValue = stepIntAttr.getInt();
+
+  // Calculate iteration count
+  if (stepValue <= 0 || ubValue <= lbValue) {
+    return forOp.emitError("Invalid for loop bounds");
+  }
+
+  int64_t count = (ubValue - lbValue + stepValue - 1) / stepValue;
+
+  // Validate that we're inside a function (for context checking)
+  auto funcOp = forOp->getParentOfType<mlir::func::FuncOp>();
+  if (!funcOp) {
+    return forOp.emitError("scf.for not within a function");
+  }
+
+  // Handle the result value if the for loop has results
+  Value forResult;
+  if (forOp.getNumResults() > 0) {
+    forResult = forOp.getResult(0);
+  }
+
+  // Replace with calyx.repeat
+  OpBuilder builder(forOp);
+  auto calyxRepeatOp = builder.create<calyx::RepeatOp>(
+      forOp.getLoc(), static_cast<uint32_t>(count));
+
+  // Move the body region contents to the new RepeatOp
+  auto &forRegion = forOp.getRegion();
+  if (!forRegion.empty()) {
+    auto &forBlock = forRegion.front();
+    auto &repeatBlock = calyxRepeatOp.getBodyRegion().front();
+
+    // Move all operations except the yield
+    for (auto &op : llvm::make_early_inc_range(forBlock)) {
+      if (isa<mlir::scf::YieldOp>(op)) {
+        op.erase(); // Remove yield as Calyx repeat doesn't need it
+        continue;
+      }
+      op.moveBefore(&repeatBlock, repeatBlock.end());
+    }
+  }
+
+  // If the for loop had results, we need to handle them
+  // For now, we'll create a placeholder - this might need more sophisticated
+  // handling
+  if (forResult) {
+    // Find the wires operation and set insertion point before it
+    auto &entryBlock = funcOp.front();
+    auto wiresOps = entryBlock.getOps<calyx::WiresOp>();
+    if (!wiresOps.empty()) {
+      auto wiresOp = *wiresOps.begin();
+      functionBuilder.setInsertionPoint(wiresOp);
+    }
+
+    // Create a temporary register to hold the result
+    std::string regName = "for_result_" + getOpUniqueName(forOp);
+    auto resultReg = functionBuilder.create<calyx::RegisterOp>(
+        forOp.getLoc(), regName, forResult.getType());
+
+    // Replace all uses of the for result with the register output
+    forResult.replaceAllUsesWith(resultReg.getOut());
+  }
+
+  // Erase the original for loop
+  forOp.erase();
 
   return success();
 }
 
-template <>
-LogicalResult ScfToCalyxPattern<mlir::scf::ExecuteRegionOp>::matchAndRewrite(
-    mlir::scf::ExecuteRegionOp op, mlir::scf::ExecuteRegionOp::Adaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-  // ExecuteRegionOp conversion not implemented
-  return rewriter.notifyMatchFailure(
-      op, "scf.execute_region conversion not implemented");
-}
+/// Transform a SCF While operation to Calyx hardware constructs
+/// This function creates registers and hardware for while loops
+LogicalResult transformScfWhileToCalyx(mlir::scf::WhileOp whileOp,
+                                       OpBuilder &wiresBuilder,
+                                       OpBuilder &functionBuilder) {
+  // Get the condition from the before region
+  Block *beforeBlock = whileOp.getBefore().getBlocks().empty()
+                           ? nullptr
+                           : &whileOp.getBefore().front();
+  if (!beforeBlock) {
+    return whileOp.emitError("while op has no before region");
+  }
 
-template <>
-LogicalResult ScfToCalyxPattern<mlir::scf::ForallOp>::matchAndRewrite(
-    mlir::scf::ForallOp op, mlir::scf::ForallOp::Adaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-  // ForallOp (parallel for) conversion not implemented
-  return rewriter.notifyMatchFailure(op,
-                                     "scf.forall conversion not implemented");
-}
+  // Find the condition operation in the before block
+  Value condition = nullptr;
+  for (auto &beforeOp : beforeBlock->getOperations()) {
+    if (auto condOp = dyn_cast<mlir::scf::ConditionOp>(beforeOp)) {
+      condition = condOp.getCondition();
+      break;
+    }
+  }
+  if (!condition) {
+    return whileOp.emitError("could not find condition in while op");
+  }
 
-template <>
-LogicalResult ScfToCalyxPattern<mlir::scf::IndexSwitchOp>::matchAndRewrite(
-    mlir::scf::IndexSwitchOp op, mlir::scf::IndexSwitchOp::Adaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-  // IndexSwitchOp conversion not implemented
-  return rewriter.notifyMatchFailure(
-      op, "scf.index_switch conversion not implemented");
-}
+  // Create a new Calyx WhileOp with the condition
+  OpBuilder builder(whileOp);
+  auto calyxWhileOp =
+      builder.create<calyx::WhileOp>(whileOp.getLoc(), condition, nullptr);
 
-template <>
-LogicalResult ScfToCalyxPattern<mlir::scf::ParallelOp>::matchAndRewrite(
-    mlir::scf::ParallelOp op, mlir::scf::ParallelOp::Adaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-  // ParallelOp conversion not implemented
-  return rewriter.notifyMatchFailure(op,
-                                     "scf.parallel conversion not implemented");
-}
+  // Move the after region (body) contents to the new WhileOp
+  if (!whileOp.getAfter().empty()) {
+    auto &afterBlock = whileOp.getAfter().front();
+    auto &whileBodyBlock = calyxWhileOp.getBodyRegion().front();
 
-template <>
-LogicalResult ScfToCalyxPattern<mlir::scf::ConditionOp>::matchAndRewrite(
-    mlir::scf::ConditionOp op, mlir::scf::ConditionOp::Adaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-  // The condition operation is handled by the parent while operation.
-  // We typically erase the condition operation since the condition value
-  // is extracted and used by the while operation conversion.
-  rewriter.eraseOp(op);
+    // Move all operations except yield
+    for (auto &op : llvm::make_early_inc_range(afterBlock)) {
+      if (isa<mlir::scf::YieldOp>(op)) {
+        op.erase(); // Remove yield as Calyx while doesn't need it
+        continue;
+      }
+      op.moveBefore(&whileBodyBlock, whileBodyBlock.end());
+    }
+  }
+
+  // Also need to move the condition evaluation from before region
+  // Move operations from before region (except condition op) to before the
+  // while
+  for (auto &op : llvm::make_early_inc_range(*beforeBlock)) {
+    if (isa<mlir::scf::ConditionOp>(op)) {
+      op.erase(); // Remove condition op
+      continue;
+    }
+    op.moveBefore(calyxWhileOp);
+  }
+
+  // Erase the original while loop
+  whileOp.erase();
 
   return success();
 }

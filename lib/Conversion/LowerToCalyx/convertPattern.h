@@ -26,26 +26,6 @@ using namespace mlir;
 // Helper function to get operation location as unique string
 std::string getOpUniqueName(mlir::Operation *op);
 
-// SCF patterns
-template <typename OpType>
-struct ScfToCalyxPattern : mlir::OpConversionPattern<OpType> {
-  using mlir::OpConversionPattern<OpType>::OpConversionPattern;
-  mlir::LogicalResult
-  matchAndRewrite(OpType op, typename OpType::Adaptor adaptor,
-                  mlir::ConversionPatternRewriter &rewriter) const override;
-};
-
-using ScfForToCalyxIfPattern = ScfToCalyxPattern<mlir::scf::ForOp>;
-using ScfWhileToCalyxIfPattern = ScfToCalyxPattern<mlir::scf::WhileOp>;
-using ScfYieldToCalyxIfPattern = ScfToCalyxPattern<mlir::scf::YieldOp>;
-using ScfExecuteRegionToCalyxPattern =
-    ScfToCalyxPattern<mlir::scf::ExecuteRegionOp>;
-using ScfForallToCalyxPattern = ScfToCalyxPattern<mlir::scf::ForallOp>;
-using ScfIndexSwitchToCalyxPattern =
-    ScfToCalyxPattern<mlir::scf::IndexSwitchOp>;
-using ScfParallelToCalyxPattern = ScfToCalyxPattern<mlir::scf::ParallelOp>;
-using ScfConditionToCalyxPattern = ScfToCalyxPattern<mlir::scf::ConditionOp>;
-
 // Arith patterns
 
 template <typename SourceType, typename TargetType>
@@ -146,10 +126,13 @@ using ArithConstantToCalyxPattern =
 using ArithSelectToCalyxPattern =
     ArithSpecialOpToCalyxPattern<mlir::arith::SelectOp>;
 // Dedicated IndexCast pattern class
-struct ArithIndexCastToCalyxPattern : mlir::OpConversionPattern<mlir::arith::IndexCastOp> {
-  using mlir::OpConversionPattern<mlir::arith::IndexCastOp>::OpConversionPattern;
+struct ArithIndexCastToCalyxPattern
+    : mlir::OpConversionPattern<mlir::arith::IndexCastOp> {
+  using mlir::OpConversionPattern<
+      mlir::arith::IndexCastOp>::OpConversionPattern;
   mlir::LogicalResult
-  matchAndRewrite(mlir::arith::IndexCastOp op, mlir::arith::IndexCastOp::Adaptor adaptor,
+  matchAndRewrite(mlir::arith::IndexCastOp op,
+                  mlir::arith::IndexCastOp::Adaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override;
 };
 

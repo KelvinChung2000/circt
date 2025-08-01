@@ -73,9 +73,6 @@ private:
   /// Step 2: Convert all basic blocks into Calyx groups.
   LogicalResult convertBlocksToGroups(ModuleOp moduleOp);
 
-  /// Step 3: Apply control flow patterns using the separated pattern classes
-  LogicalResult applyControlFlowPatterns(ModuleOp moduleOp);
-
   /// Step 4: Apply arithmetic patterns using the separated pattern classes
   LogicalResult applyArithPatterns(ModuleOp moduleOp);
 
@@ -230,7 +227,7 @@ LowerToCalyxPass::scaffoldCalyxStructure(mlir::func::FuncOp funcOp) {
                                          blockPtr->getOperations());
   }
 
-  // Transform SCF If operations to Calyx hardware constructs
+  // Transform SCF operations to Calyx hardware constructs
   // This is the primary place for SCF conversion - creates all necessary
   // registers and group_done ops
   for (auto &block : controlRegion.getBlocks()) {
@@ -240,32 +237,23 @@ LowerToCalyxPass::scaffoldCalyxStructure(mlir::func::FuncOp funcOp) {
         // Handle error if needed
       }
     });
+
+    // Look for SCF For operations
+    block.walk([&](mlir::scf::ForOp forOp) {
+      if (failed(transformScfForToCalyx(forOp, wiresBuilder, builder))) {
+        // Handle error if needed
+      }
+    });
+
+    // Look for SCF While operations
+    block.walk([&](mlir::scf::WhileOp whileOp) {
+      if (failed(transformScfWhileToCalyx(whileOp, wiresBuilder, builder))) {
+        // Handle error if needed
+      }
+    });
   }
 
   return success();
-}
-
-LogicalResult LowerToCalyxPass::applyControlFlowPatterns(ModuleOp moduleOp) {
-  ConversionTarget target(getContext());
-  target.addLegalDialect<calyx::CalyxDialect, arith::ArithDialect>();
-
-  // Mark control flow operations as illegal
-  target.addIllegalOp<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp,
-                      mlir::scf::YieldOp>();
-  // target.addIllegalOp<mlir::cf::BranchOp, mlir::cf::CondBranchOp>();
-
-  // Set up type converter
-  TypeConverter typeConverter;
-  typeConverter.addConversion([](Type type) { return type; });
-
-  RewritePatternSet patterns(&getContext());
-
-  // Add control flow patterns with typeConverter (conversion patterns)
-  patterns.add<lowertocalyx::ScfForToCalyxIfPattern,
-               lowertocalyx::ScfWhileToCalyxIfPattern>(typeConverter,
-                                                       &getContext());
-
-  return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 
 LogicalResult LowerToCalyxPass::convertBlocksToGroups(ModuleOp moduleOp) {

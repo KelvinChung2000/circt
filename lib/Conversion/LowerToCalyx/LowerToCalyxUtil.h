@@ -3,6 +3,7 @@
 
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Region.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -44,6 +45,21 @@ mlir::Value resolveDoneSignalForValue(mlir::Value val,
 void updateComponentDoneConnection(circt::calyx::ComponentOp comp,
                                    mlir::Value newDone, mlir::Location loc,
                                    mlir::OpBuilder &builder);
+
+/// Transform SCF control flow operations to Calyx hardware constructs
+/// These functions create the necessary hardware (registers, assignments) during 
+/// the function-to-component conversion phase
+mlir::LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
+                                         mlir::OpBuilder &wiresBuilder,
+                                         mlir::OpBuilder &functionBuilder);
+
+mlir::LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
+                                          mlir::OpBuilder &wiresBuilder,
+                                          mlir::OpBuilder &functionBuilder);
+
+mlir::LogicalResult transformScfWhileToCalyx(mlir::scf::WhileOp whileOp,
+                                            mlir::OpBuilder &wiresBuilder,
+                                            mlir::OpBuilder &functionBuilder);
 
 /// Returns or creates a hw::ConstantOp with the specified value within the
 /// given operation. If a constant with the same value and bit width already
