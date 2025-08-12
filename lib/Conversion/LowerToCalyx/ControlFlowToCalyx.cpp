@@ -238,12 +238,13 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
     auto &elseBlock = elseRegion.front();
     for (auto &op : llvm::make_early_inc_range(elseBlock)) {
       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-        rewriter.setInsertionPoint(&op);
+        rewriter.setInsertionPoint(wiresOp);
         // Create the NotLibOp at function level for now
         auto conditionType = condition.getType();
         auto invertedCondition = rewriter.create<calyx::NotLibOp>(
             ifOp.getLoc(), "inverted_cond_" + getOpUniqueName(ifOp),
             llvm::SmallVector<mlir::Type>{conditionType, conditionType});
+        rewriter.setInsertionPoint(&op);
         rewriter.create<calyx::AssignOp>(op.getLoc(), invertedCondition.getIn(),
                                          ifOp.getCondition());
         // Create assignment: reg.in = elseYieldValue

@@ -64,8 +64,6 @@ private:
   /// Map from result value pointer to register name for lookup during pattern
   /// conversion
   DenseMap<uintptr_t, std::string> resultToRegisterName;
-  /// Step 1: Set up the basic Calyx component structure within each function.
-  LogicalResult scaffoldCalyxStructure(mlir::func::FuncOp funcOp);
 
   /// Step 2: Apply SCF (Structured Control Flow) to Calyx conversion patterns
   LogicalResult applyControlFlowConversion(ModuleOp moduleOp);
@@ -156,75 +154,14 @@ void LowerToCalyxPass::runOnOperation() {
   }
 }
 
-LogicalResult
-LowerToCalyxPass::scaffoldCalyxStructure(mlir::func::FuncOp funcOp) {
-  OpBuilder builder(funcOp.getContext());
-
-  // Get function information before conversion
-  std::string componentName = funcOp.getName().str();
-  auto loc = funcOp.getLoc();
-  // Save the original blocks before creating new structure
-  auto &funcBlocks = funcOp.getBlocks();
-  llvm::SmallVector<Block *> originalBlocks;
-  for (auto &block : funcBlocks) {
-    originalBlocks.push_back(&block);
-  }
-
-  // Save the original entry block (with arguments) and clear its operations
-  Block *entryBlock = &funcOp.getBody().front();
-  SmallVector<std::unique_ptr<Block>> tempBlocks;
-
-  // Move the entry block operations to temp storage
-  tempBlocks.push_back(std::make_unique<Block>());
-  tempBlocks.back()->getOperations().splice(tempBlocks.back()->begin(),
-                                            entryBlock->getOperations());
-
-  // Move any additional blocks to temp storage
-  for (auto it = std::next(originalBlocks.begin()); it != originalBlocks.end();
-       ++it) {
-    Block *block = *it;
-    tempBlocks.push_back(std::unique_ptr<Block>(block));
-    block->getParent()->getBlocks().remove(block);
-  }
-
-  // Set insertion point to the cleared entry block (preserves arguments)
-  builder.setInsertionPointToStart(entryBlock);
-
-  // Create the `calyx.wires` and `calyx.control` ops in the function
-  // Note: WiresOp and ControlOp automatically create blocks via their custom
-  // builders
-  auto wiresOp = builder.create<calyx::WiresOp>(loc);
-  auto controlOp = builder.create<calyx::ControlOp>(loc);
-
-  // Use the automatically created blocks (do not create additional blocks)
-  OpBuilder wiresBuilder(&wiresOp.getBody().front(),
-                         wiresOp.getBody().front().begin());
-
-  // Use the automatically created block in the control region
-  auto &controlRegion = controlOp.getBodyRegion();
-  Block *controlBlock = &controlRegion.front();
-
-  // Move all operations from temp blocks into the single control block
-  OpBuilder controlBuilder(controlBlock, controlBlock->begin());
-  for (auto &blockPtr : tempBlocks) {
-    // Move all operations from each temp block to the single control block
-    controlBlock->getOperations().splice(controlBlock->end(),
-                                         blockPtr->getOperations());
-  }
-
-  // Note: SCF operations are now handled in applyControlFlowConversion()
-
-  return success();
-}
-
 LogicalResult LowerToCalyxPass::applyControlFlowConversion(ModuleOp moduleOp) {
   ConversionTarget target(getContext());
   target.addLegalDialect<calyx::CalyxDialect, arith::ArithDialect,
                          comb::CombDialect, hw::HWDialect>();
-  
+
   // Allow memref operations during SCF conversion - they'll be converted later
   target.addLegalDialect<mlir::memref::MemRefDialect>();
-  
+
   // Mark SCF operations as illegal to trigger conversion
   target.addIllegalOp<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp>();
 
@@ -468,7 +405,7 @@ LowerToCalyxPass::applyFuncSignatureConversion(ModuleOp moduleOp) {
   // removal
   TypeConverter typeConverter;
   typeConverter.addConversion([](Type type) -> Type {
-    if (type.isIndex()) {
+    if (dyn_cast<IndexType>(type)) {
       return IntegerType::get(type.getContext(), 32);
     }
     return type;

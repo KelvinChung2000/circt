@@ -41,7 +41,8 @@ mlir::Value resolveDoneSignalForValue(mlir::Value val,
 
 /// Creates an AND gate to combine two done signals
 mlir::Value createAndGate(mlir::Value leftDone, mlir::Value rightDone,
-                         mlir::Operation *requestingOp, mlir::Operation *parentOp);
+                          mlir::Operation *requestingOp,
+                          mlir::Operation *parentOp);
 
 /// Updates the component's done port connection with the provided done signal.
 /// This function finds the component's done port and creates an assignment
@@ -51,19 +52,19 @@ void updateComponentDoneConnection(circt::calyx::ComponentOp comp,
                                    mlir::OpBuilder &builder);
 
 /// Transform SCF control flow operations to Calyx hardware constructs
-/// These functions create the necessary hardware (registers, assignments) during 
-/// the function-to-component conversion phase
+/// These functions create the necessary hardware (registers, assignments)
+/// during the function-to-component conversion phase
 mlir::LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
-                                         mlir::OpBuilder &wiresBuilder,
-                                         mlir::OpBuilder &functionBuilder);
-
-mlir::LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
                                           mlir::OpBuilder &wiresBuilder,
                                           mlir::OpBuilder &functionBuilder);
 
+mlir::LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
+                                           mlir::OpBuilder &wiresBuilder,
+                                           mlir::OpBuilder &functionBuilder);
+
 mlir::LogicalResult transformScfWhileToCalyx(mlir::scf::WhileOp whileOp,
-                                            mlir::OpBuilder &wiresBuilder,
-                                            mlir::OpBuilder &functionBuilder);
+                                             mlir::OpBuilder &wiresBuilder,
+                                             mlir::OpBuilder &functionBuilder);
 
 /// Returns or creates a hw::ConstantOp with the specified value within the
 /// given operation. If a constant with the same value and bit width already
@@ -130,6 +131,23 @@ mlir::Operation *getOrCreateOperation(mlir::Operation *parentOp,
   auto newOp = creator();
   return newOp.getOperation();
 }
+
+/// Converts a value to match the target address port type using Calyx
+/// SliceLibOp. This function handles type conversion for memory address ports
+/// by:
+/// - Returning the original value if types already match
+/// - Creating a SliceLibOp to truncate wider values to narrower address ports
+/// - Using the existing Calyx-native approach for hardware synthesis
+/// The componentOp parameter is used to find an appropriate location for
+/// creating the slice operation, and uniqueName helps create unique slice
+/// operation names.
+mlir::Value convertValueForToMatchType(mlir::Value addressPort,
+                                       mlir::Value indexValue,
+                                       circt::calyx::WiresOp wiresOp,
+                                       mlir::OpBuilder &wiresBuilder,
+                                       llvm::StringRef uniqueName,
+                                       mlir::Location loc,
+                                       mlir::ConversionPatternRewriter &rewriter);
 
 } // namespace lowertocalyx
 } // namespace circt

@@ -521,5 +521,59 @@ mlir::Value createReg(mlir::Operation *parentOp, mlir::Type type,
   return regOp.getOut();
 }
 
+/// Converts a value to match the target address port type using Calyx
+/// SliceLibOp
+Value convertValueForToMatchType(Value lhs, Value rhs, calyx::WiresOp wiresOp,
+                                 OpBuilder &wiresBuilder, StringRef uniqueName,
+                                 Location loc,
+                                 ConversionPatternRewriter &rewriter) {
+  Type lhsType = lhs.getType();
+  Type rhsType = rhs.getType();
+
+  // Continue with the original logic
+
+  // If types already match, return original value
+  if (lhsType == rhsType) {
+    return rhs;
+  }
+
+  // Both should be integer types for address ports
+  auto addrIntType = dyn_cast<IntegerType>(lhsType);
+  auto indexIntType = dyn_cast<IntegerType>(rhsType);
+
+  if (!addrIntType || !indexIntType) {
+    // Can't convert non-integer types, return original
+    return rhs;
+  }
+
+  unsigned addrWidth = addrIntType.getWidth();
+  unsigned indexWidth = indexIntType.getWidth();
+
+  if (addrWidth >= indexWidth) {
+    // Address port is wider or same size, no conversion needed
+    return rhs;
+  }
+
+  // Need to truncate indexValue to fit address port
+  // Use Calyx SliceLibOp (following the exact pattern from ArithToCalyx.cpp)
+  std::string sliceName = ("slice_addr_" + uniqueName).str();
+
+  // Create slice operation at component level (before wires section)
+  OpBuilder::InsertionGuard sliceGuard(rewriter);
+  rewriter.setInsertionPoint(wiresOp);
+
+  // SliceLibOp takes input type and output type (following ArithToCalyx pattern)
+  SmallVector<Type> sliceTypes = {rhsType, lhsType};
+  auto sliceOp = rewriter.create<calyx::SliceLibOp>(
+      loc, rewriter.getStringAttr(sliceName), sliceTypes);
+
+  // Assign input to slice operation in wires section
+  OpBuilder::InsertionGuard wiresGuard(wiresBuilder);
+  wiresBuilder.setInsertionPointToEnd(wiresOp.getBodyBlock());
+  wiresBuilder.create<calyx::AssignOp>(loc, sliceOp.getIn(), rhs);
+
+  return sliceOp.getOut();
+}
+
 } // namespace lowertocalyx
 } // namespace circt

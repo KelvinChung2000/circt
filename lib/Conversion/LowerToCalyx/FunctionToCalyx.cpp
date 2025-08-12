@@ -6,6 +6,7 @@
 #include "convertPattern.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -127,11 +128,23 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
           Value addrPort = memOp.addrPort(0);
           Value indexValue = loadOp.getIndices()[0];
 
-          // Skip assignment if types don't match (will need proper conversion
-          // later)
-          if (addrPort.getType() == indexValue.getType()) {
-            loadBuilder.create<calyx::AssignOp>(loc, addrPort, indexValue);
+          // Convert index value using type converter first
+          // The type converter converts index to i32
+          Value convertedIndexValue = indexValue;
+          if (indexValue.getType().isIndex()) {
+            // Create cast from index to i32 as expected by type converter
+            auto i32Type = rewriter.getI32Type();
+            convertedIndexValue = rewriter
+                                      .create<UnrealizedConversionCastOp>(
+                                          loc, i32Type, indexValue)
+                                      .getResult(0);
           }
+
+          // Use utility function for address port type conversion
+          Value convertedAddr = convertValueForToMatchType(
+              addrPort, convertedIndexValue, wiresOp, loadBuilder,
+              getOpUniqueName(loadOp.getOperation()), loc, rewriter);
+          loadBuilder.create<calyx::AssignOp>(loc, addrPort, convertedAddr);
           // Note: Don't need to assign to loadOp.getResult() - we replace the
           // entire operation
           auto true_value = getOrCreateConstant(op, 1);
@@ -150,11 +163,23 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
           Value addrPort = memOp.addrPort(0);
           Value indexValue = storeOp.getIndices()[0];
 
-          // Skip assignment if types don't match (will need proper conversion
-          // later)
-          if (addrPort.getType() == indexValue.getType()) {
-            storeBuilder.create<calyx::AssignOp>(loc, addrPort, indexValue);
+          // Convert index value using type converter first
+          // The type converter converts index to i32
+          Value convertedIndexValue = indexValue;
+          if (indexValue.getType().isIndex()) {
+            // Create cast from index to i32 as expected by type converter
+            auto i32Type = rewriter.getI32Type();
+            convertedIndexValue = rewriter
+                                      .create<UnrealizedConversionCastOp>(
+                                          loc, i32Type, indexValue)
+                                      .getResult(0);
           }
+
+          // Use utility function for address port type conversion
+          Value convertedAddr = convertValueForToMatchType(
+              addrPort, convertedIndexValue, wiresOp, storeBuilder,
+              getOpUniqueName(storeOp.getOperation()), loc, rewriter);
+          storeBuilder.create<calyx::AssignOp>(loc, addrPort, convertedAddr);
           storeBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
                                                storeOp.getValueToStore());
           auto true_value = getOrCreateConstant(op, 1);
@@ -173,11 +198,23 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
             Value addrPort = memOp.addrPort(0);
             Value indexValue = loadOp.getIndices()[0];
 
-            // Skip assignment if types don't match (will need proper conversion
-            // later)
-            if (addrPort.getType() == indexValue.getType()) {
-              loadBuilder.create<calyx::AssignOp>(loc, addrPort, indexValue);
+            // Convert index value using type converter first
+            Type convertedIndexType =
+                typeConverter->convertType(indexValue.getType());
+            Value convertedIndexValue = indexValue;
+            if (convertedIndexType &&
+                convertedIndexType != indexValue.getType()) {
+              convertedIndexValue = rewriter
+                                        .create<UnrealizedConversionCastOp>(
+                                            loc, convertedIndexType, indexValue)
+                                        .getResult(0);
             }
+
+            // Use utility function for address port type conversion
+            Value convertedAddr = convertValueForToMatchType(
+                addrPort, convertedIndexValue, wiresOp, loadBuilder,
+                getOpUniqueName(loadOp.getOperation()), loc, rewriter);
+            loadBuilder.create<calyx::AssignOp>(loc, addrPort, convertedAddr);
             // Note: Don't need to assign to loadOp.getResult() - we replace the
             // entire operation
             auto true_value = getOrCreateConstant(op, 1);
@@ -196,11 +233,23 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
             Value addrPort = memOp.addrPort(0);
             Value indexValue = storeOp.getIndices()[0];
 
-            // Skip assignment if types don't match (will need proper conversion
-            // later)
-            if (addrPort.getType() == indexValue.getType()) {
-              storeBuilder.create<calyx::AssignOp>(loc, addrPort, indexValue);
+            // Convert index value using type converter first
+            Type convertedIndexType =
+                typeConverter->convertType(indexValue.getType());
+            Value convertedIndexValue = indexValue;
+            if (convertedIndexType &&
+                convertedIndexType != indexValue.getType()) {
+              convertedIndexValue = rewriter
+                                        .create<UnrealizedConversionCastOp>(
+                                            loc, convertedIndexType, indexValue)
+                                        .getResult(0);
             }
+
+            // Use utility function for address port type conversion
+            Value convertedAddr = convertValueForToMatchType(
+                addrPort, convertedIndexValue, wiresOp, storeBuilder,
+                getOpUniqueName(storeOp.getOperation()), loc, rewriter);
+            storeBuilder.create<calyx::AssignOp>(loc, addrPort, convertedAddr);
             storeBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
                                                  storeOp.getValueToStore());
             auto true_value = getOrCreateConstant(op, 1);

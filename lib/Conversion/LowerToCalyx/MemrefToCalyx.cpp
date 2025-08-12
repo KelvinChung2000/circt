@@ -153,29 +153,10 @@ LogicalResult MemrefLoadToCalyxPattern::matchAndRewrite(
   auto wiresOp = componentOp.getWiresOp();
   OpBuilder wiresBuilder(wiresOp.getBodyBlock(), wiresOp.getBodyBlock()->end());
 
-  // Handle type conversion - cast i32 index to i4 address
-  if (addrPort.getType() != indexValue.getType()) {
-    auto addrPortType = cast<IntegerType>(addrPort.getType());
-
-    // Create Calyx slice operation directly instead of arith.trunci
-    std::string sliceName =
-        "slice_addr_" + getOpUniqueName(loadOp.getOperation());
-
-    // Create slice operation at component level
-    OpBuilder::InsertionGuard sliceGuard(rewriter);
-    rewriter.setInsertionPointToStart(componentOp.getBodyBlock());
-
-    // SliceLibOp takes input type and output type
-    SmallVector<Type> sliceTypes = {indexValue.getType(), addrPortType};
-    auto sliceOp = rewriter.create<calyx::SliceLibOp>(
-        loc, rewriter.getStringAttr(sliceName), sliceTypes);
-
-    // Assign input to slice and slice output to address port
-    wiresBuilder.create<calyx::AssignOp>(loc, sliceOp.getIn(), indexValue);
-    addrOut = sliceOp.getOut();
-  } else {
-    addrOut = indexValue;
-  }
+  // Use shared utility function for address port type conversion
+  addrOut = convertValueForToMatchType(
+      addrPort, indexValue, wiresOp, wiresBuilder,
+      getOpUniqueName(loadOp.getOperation()), loc, rewriter);
 
   // Now work within the existing group where the load operation was located
   rewriter.setInsertionPoint(loadOp);
@@ -271,29 +252,10 @@ LogicalResult MemrefStoreToCalyxPattern::matchAndRewrite(
   auto wiresOp = componentOp.getWiresOp();
   OpBuilder wiresBuilder(wiresOp.getBodyBlock(), wiresOp.getBodyBlock()->end());
 
-  // Handle type conversion - cast i32 index to i4 address
-  if (addrPort.getType() != indexValue.getType()) {
-    auto addrPortType = cast<IntegerType>(addrPort.getType());
-
-    // Create Calyx slice operation directly instead of arith.trunci
-    std::string sliceName =
-        "slice_addr_" + getOpUniqueName(storeOp.getOperation());
-
-    // Create slice operation at component level
-    OpBuilder::InsertionGuard sliceGuard(rewriter);
-    rewriter.setInsertionPointToStart(componentOp.getBodyBlock());
-
-    // SliceLibOp takes input type and output type
-    SmallVector<Type> sliceTypes = {indexValue.getType(), addrPortType};
-    auto sliceOp = rewriter.create<calyx::SliceLibOp>(
-        loc, rewriter.getStringAttr(sliceName), sliceTypes);
-
-    // Assign input to slice and slice output to address port
-    wiresBuilder.create<calyx::AssignOp>(loc, sliceOp.getIn(), indexValue);
-    addrOut = sliceOp.getOut();
-  } else {
-    addrOut = indexValue;
-  }
+  // Use shared utility function for address port type conversion
+  addrOut = convertValueForToMatchType(
+      addrPort, indexValue, wiresOp, wiresBuilder,
+      getOpUniqueName(storeOp.getOperation()), loc, rewriter);
 
   // Connect value to memory write data within the existing group
   rewriter.create<calyx::AssignOp>(loc, addrPort, addrOut);
