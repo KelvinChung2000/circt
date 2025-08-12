@@ -48,17 +48,45 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
   SmallVector<Type> outputTypes;
   SmallVector<std::pair<size_t, MemRefType>> memrefArgs; // argIndex, memrefType
 
-  // Check if function already has Calyx operations (scaffolded)
+  // SIMPLE SCAFFOLDING: Create scaffolding directly without complex logic
+  // Simply create wires and control ops if they don't exist
+  calyx::WiresOp wiresOp;
+  calyx::ControlOp controlOp;
+
   auto wiresOps = op.getFunctionBody().getOps<calyx::WiresOp>();
   if (wiresOps.empty()) {
-    return rewriter.notifyMatchFailure(
-        op, "Function must be scaffolded with Calyx operations first");
+    // Create basic scaffolding without complex block manipulation
+    rewriter.setInsertionPointToStart(&op.getBody().front());
+    wiresOp = rewriter.create<calyx::WiresOp>(loc);
+    controlOp = rewriter.create<calyx::ControlOp>(loc);
+
+    // Move all original operations to the control block
+    Block *controlBlock = &controlOp.getBodyRegion().front();
+    SmallVector<Operation *> opsToMove;
+    for (auto &op : op.getBody().front()) {
+      if (!isa<calyx::WiresOp, calyx::ControlOp>(op)) {
+        opsToMove.push_back(&op);
+      }
+    }
+
+    for (auto *opToMove : opsToMove) {
+      opToMove->moveBefore(controlBlock, controlBlock->end());
+    }
+  } else {
+    wiresOp = *wiresOps.begin();
+    auto controlOps = op.getFunctionBody().getOps<calyx::ControlOp>();
+    if (controlOps.empty()) {
+      return rewriter.notifyMatchFailure(
+          op, "Function has wires but no control operation");
+    }
+    controlOp = *controlOps.begin();
   }
-  auto wiresOp = *wiresOps.begin();
+
+  // Create builder for memory operations in wires section
   OpBuilder componentBuilder(rewriter.getContext());
   componentBuilder.setInsertionPoint(wiresOp);
 
-  // Process input types using TypeConverter
+  // Process input types using TypeConverter - simplified
   for (size_t i = 0; i < funcType.getInputs().size(); ++i) {
     Type inputType = funcType.getInputs()[i];
     if (auto memrefType = dyn_cast<MemRefType>(inputType)) {
@@ -220,7 +248,6 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
            inputTypes[portIndex], calyx::Direction::Input,
            DictionaryAttr::get(rewriter.getContext())});
       portIndex++;
-    } else {
     }
   }
 
@@ -240,9 +267,9 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
   // Create the component operation
   auto componentOp = rewriter.create<calyx::ComponentOp>(
       loc, rewriter.getStringAttr(op.getName()), ports);
-  // Get the function's block
-  Block *funcBlock = &op.getBody().front();
 
+  // Handle argument replacement for non-memref arguments
+  Block *funcBlock = &op.getBody().front();
   size_t componentArgIndex = 0;
   for (size_t i = 0; i < op.getNumArguments(); ++i) {
     bool isMemref = false;
@@ -280,7 +307,7 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
     opToMove.moveBefore(compBlock, compBlock->end());
   }
 
-  op.erase();
+  rewriter.eraseOp(op);
   return success();
 }
 

@@ -108,51 +108,32 @@ private:
 void LowerToCalyxPass::runOnOperation() {
   ModuleOp moduleOp = getOperation();
 
-  // Step 0: Index conversion is now integrated into function conversion
-  // to handle type coherence properly
-
-  // Step 1: Add wires section and wrap function body in control op
-  // (scaffolding)
-  // SmallVector<mlir::func::FuncOp> functionsToProcess;
-  // for (auto funcOp : moduleOp.getOps<mlir::func::FuncOp>()) {
-  //   if (shouldProcessFunction(funcOp)) {
-  //     functionsToProcess.push_back(funcOp);
-  //   }
-  // }
-
   if (moduleOp.getOps<mlir::func::FuncOp>().empty()) {
     return; // Nothing to process
   }
 
-  // Process each function with scaffolding
-  for (auto funcOp : moduleOp.getOps<mlir::func::FuncOp>()) {
-    if (failed(scaffoldCalyxStructure(funcOp))) {
-      signalPassFailure();
-      return;
-    }
-  }
-
-  // Step 2: Convert function signatures to components (first part of function
-  // conversion)
+  // Step 1: Convert function signatures to components with integrated
+  // scaffolding This now includes scaffolding creation inline if not already
+  // present
   if (failed(applyFuncSignatureConversion(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 3: Convert memref operations BEFORE arithmetic (to establish proper
+  // Step 2: Convert memref operations BEFORE arithmetic (to establish proper
   // value dependencies)
   if (failed(applyMemoryPatterns(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 4: Convert arith operations to equivalent std ops (patterns)
+  // Step 3: Convert arith operations to equivalent std ops (patterns)
   if (failed(applyArithPatterns(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 5: Convert return operations (second part of function conversion)
+  // Step 4: Convert return operations (second part of function conversion)
   if (failed(applyReturnConversion(moduleOp))) {
     signalPassFailure();
     return;
@@ -163,22 +144,10 @@ void LowerToCalyxPass::runOnOperation() {
     return;
   }
 
-  // // Step 6: Apply empty group optimization first, then control flow wrapping
-  // if (failed(applyEmptyGroupOptimization(moduleOp))) {
-  //   signalPassFailure();
-  //   return;
-  // }
-
   if (failed(applyControlFlowWrapping(moduleOp))) {
     signalPassFailure();
     return;
   }
-
-  // Step 8b: Validation
-  // if (failed(validateConversion(moduleOp))) {
-  //   signalPassFailure();
-  //   return;
-  // }
 }
 
 LogicalResult
