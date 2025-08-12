@@ -28,6 +28,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include <cassert>
 
 using namespace circt;
@@ -36,11 +37,7 @@ using namespace mlir;
 
 // Forward declaration from ControlFlowToCalyx.cpp
 namespace circt {
-namespace lowertocalyx {
-LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
-                                    OpBuilder &wiresBuilder,
-                                    OpBuilder &functionBuilder);
-}
+namespace lowertocalyx {}
 } // namespace circt
 
 namespace circt {
@@ -70,8 +67,8 @@ private:
   /// Step 1: Set up the basic Calyx component structure within each function.
   LogicalResult scaffoldCalyxStructure(mlir::func::FuncOp funcOp);
 
-  /// Step 2: Convert all basic blocks into Calyx groups.
-  LogicalResult convertBlocksToGroups(ModuleOp moduleOp);
+  /// Step 2: Apply SCF (Structured Control Flow) to Calyx conversion patterns
+  LogicalResult applyControlFlowConversion(ModuleOp moduleOp);
 
   /// Step 4: Apply arithmetic patterns using the separated pattern classes
   LogicalResult applyArithPatterns(ModuleOp moduleOp);
@@ -97,6 +94,9 @@ private:
   /// Step 8b: Validate that all operations have been converted
   LogicalResult validateConversion(ModuleOp moduleOp);
 
+  /// Step 2: Convert all basic blocks into Calyx groups.
+  LogicalResult convertBlocksToGroups(ModuleOp moduleOp);
+
   /// Helper to check if a function should be processed
   bool shouldProcessFunction(mlir::func::FuncOp funcOp);
 };
@@ -116,6 +116,12 @@ void LowerToCalyxPass::runOnOperation() {
   // scaffolding This now includes scaffolding creation inline if not already
   // present
   if (failed(applyFuncSignatureConversion(moduleOp))) {
+    signalPassFailure();
+    return;
+  }
+
+  // Step 1a: Apply SCF (Structured Control Flow) conversion patterns
+  if (failed(applyControlFlowConversion(moduleOp))) {
     signalPassFailure();
     return;
   }
@@ -206,33 +212,32 @@ LowerToCalyxPass::scaffoldCalyxStructure(mlir::func::FuncOp funcOp) {
                                          blockPtr->getOperations());
   }
 
-  // Transform SCF operations to Calyx hardware constructs
-  // This is the primary place for SCF conversion - creates all necessary
-  // registers and group_done ops
-  for (auto &block : controlRegion.getBlocks()) {
-    // Look for SCF If operations
-    block.walk([&](mlir::scf::IfOp ifOp) {
-      if (failed(transformScfIfToCalyx(ifOp, wiresBuilder, builder))) {
-        // Handle error if needed
-      }
-    });
-
-    // Look for SCF For operations
-    block.walk([&](mlir::scf::ForOp forOp) {
-      if (failed(transformScfForToCalyx(forOp, wiresBuilder, builder))) {
-        // Handle error if needed
-      }
-    });
-
-    // Look for SCF While operations
-    block.walk([&](mlir::scf::WhileOp whileOp) {
-      if (failed(transformScfWhileToCalyx(whileOp, wiresBuilder, builder))) {
-        // Handle error if needed
-      }
-    });
-  }
+  // Note: SCF operations are now handled in applyControlFlowConversion()
 
   return success();
+}
+
+LogicalResult LowerToCalyxPass::applyControlFlowConversion(ModuleOp moduleOp) {
+  ConversionTarget target(getContext());
+  target.addLegalDialect<calyx::CalyxDialect, arith::ArithDialect,
+                         comb::CombDialect, hw::HWDialect>();
+  
+  // Allow memref operations during SCF conversion - they'll be converted later
+  target.addLegalDialect<mlir::memref::MemRefDialect>();
+  
+  // Mark SCF operations as illegal to trigger conversion
+  target.addIllegalOp<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp>();
+
+  RewritePatternSet patterns(&getContext());
+
+  // Set up type converter
+  TypeConverter typeConverter;
+  typeConverter.addConversion([](Type type) -> Type { return type; });
+
+  // Add SCF to Calyx conversion patterns
+  patterns.add<lowertocalyx::ScfIfToCalyxPattern>(typeConverter, &getContext());
+
+  return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 
 LogicalResult LowerToCalyxPass::convertBlocksToGroups(ModuleOp moduleOp) {

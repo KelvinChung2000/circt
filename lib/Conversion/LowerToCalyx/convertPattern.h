@@ -288,6 +288,17 @@ public:
                   ConversionPatternRewriter &rewriter) const override;
 };
 
+/// SCF control flow patterns
+/// Pattern to convert SCF if operations to Calyx hardware constructs
+class ScfIfToCalyxPattern : public OpConversionPattern<mlir::scf::IfOp> {
+public:
+  using OpConversionPattern<mlir::scf::IfOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mlir::scf::IfOp ifOp, mlir::scf::IfOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
 } // namespace lowertocalyx
 } // namespace circt
 

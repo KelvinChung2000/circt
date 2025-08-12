@@ -18,9 +18,9 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/Transforms/RegionUtils.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/RegionUtils.h"
 
 #include <cassert>
 
@@ -63,9 +63,12 @@ static bool hasNoSideEffects(Region &region) {
 /// Transform a single SCF If operation to Calyx hardware constructs
 /// This function creates registers, not ops, and assigns directly in the
 /// transformation. If both branches have no side effects, it uses MuxLibOp.
-LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
-                                    OpBuilder &wiresBuilder,
-                                    OpBuilder &functionBuilder) {
+
+// SCF if to Calyx conversion pattern implementation
+LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
+    mlir::scf::IfOp ifOp, mlir::scf::IfOp::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+
   // Skip if this if operation doesn't have results
   if (ifOp.getNumResults() == 0) {
     return success();
@@ -75,31 +78,22 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
   Value condition = ifOp.getCondition();
   Value ifResult = ifOp.getResult(0);
 
-  // Create register at function body level - before wires op
-  // Find the wires operation and insert before it
-  auto funcOp = ifOp->getParentOfType<mlir::func::FuncOp>();
-  if (!funcOp) {
-    return ifOp.emitError("scf.if not within a function");
+  // Create register at component level - find the component and wires op
+  auto componentOp = ifOp->getParentOfType<calyx::ComponentOp>();
+  if (!componentOp) {
+    return rewriter.notifyMatchFailure(ifOp, "scf.if not within a component");
   }
 
-  auto &entryBlock = funcOp.front();
-  auto wiresOps = entryBlock.getOps<calyx::WiresOp>();
-  if (wiresOps.empty()) {
-    return ifOp.emitError("No WiresOp found in function");
+  auto wiresOp = componentOp.getWiresOp();
+  if (!wiresOp) {
+    return rewriter.notifyMatchFailure(ifOp, "No WiresOp found in component");
   }
-  auto wiresOp = *wiresOps.begin();
-
-  // Set insertion point before wires op
-  functionBuilder.setInsertionPoint(wiresOp);
+  // Set insertion point in the wires op body for register creation
+  rewriter.setInsertionPoint(wiresOp);
 
   std::string regName = "reg_" + getOpUniqueName(ifOp);
-  auto resultReg = functionBuilder.create<calyx::RegisterOp>(
-      ifOp.getLoc(), regName, ifResult.getType());
-
-  // Value regIn = resultReg.getResult(0);      // reg.in
-  // Value regWriteEn = resultReg.getResult(1); // reg.write_en
-  // Value regOut = resultReg.getResult(4);     // reg.out
-  // Value regDone = resultReg.getResult(5);    // reg.done
+  auto resultReg = rewriter.create<calyx::RegisterOp>(ifOp.getLoc(), regName,
+                                                      ifResult.getType());
 
   // Find the yield values in then and else regions
   Value thenYieldValue = nullptr;
@@ -134,7 +128,8 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
   }
 
   if (!thenYieldValue || !elseYieldValue) {
-    return ifOp.emitError("Could not find yield values in scf.if branches");
+    return rewriter.notifyMatchFailure(
+        ifOp, "Could not find yield values in scf.if branches");
   }
 
   // Check if both branches have no side effects - if so, use MuxLibOp
@@ -148,7 +143,6 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
     auto resultType = ifResult.getType();
 
     // First, move all operations from both regions out of the scf.if
-    OpBuilder builder(ifOp);
     IRMapping thenMapping, elseMapping;
 
     // Clone operations from then region (excluding yield)
@@ -165,7 +159,7 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
           continue; // Don't clone yield
         }
         // Clone the operation before the scf.if
-        auto *clonedOp = builder.clone(op, thenMapping);
+        auto *clonedOp = rewriter.clone(op, thenMapping);
         (void)clonedOp; // Mark as used
       }
     }
@@ -184,47 +178,40 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
           continue; // Don't clone yield
         }
         // Clone the operation before the scf.if
-        auto *clonedOp = builder.clone(op, elseMapping);
+        auto *clonedOp = rewriter.clone(op, elseMapping);
         (void)clonedOp; // Mark as used
       }
     }
 
-    // Create MuxLibOp at function level
-    functionBuilder.setInsertionPoint(wiresOp);
-    auto muxOp = functionBuilder.create<calyx::MuxLibOp>(
+    // Create MuxLibOp at component level
+    rewriter.setInsertionPoint(wiresOp);
+    auto muxOp = rewriter.create<calyx::MuxLibOp>(
         ifOp.getLoc(), muxName,
         llvm::SmallVector<mlir::Type>{condition.getType(), resultType,
                                       resultType, resultType});
 
     // Set up the mux connections in wires
-    wiresBuilder.setInsertionPointToEnd(wiresOp.getBodyBlock());
+    rewriter.setInsertionPointToEnd(wiresOp.getBodyBlock());
 
     // Connect condition to mux.cond
-    wiresBuilder.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getCond(),
-                                         condition);
+    rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getCond(), condition);
 
     // Connect then value to mux.tru
-    wiresBuilder.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getTru(),
-                                         thenResult);
+    rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getTru(), thenResult);
 
     // Connect else value to mux.fal
-    wiresBuilder.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getFal(),
-                                         elseResult);
+    rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getFal(), elseResult);
 
-    // Replace all uses of the scf.if result with the mux output
-    ifResult.replaceAllUsesWith(muxOp.getOut());
-
-    // Erase the original scf.if
-    ifOp.erase();
+    // Replace the scf.if operation with the mux output
+    rewriter.replaceOp(ifOp, muxOp.getOut());
 
     return success();
   }
 
   // Create constant 1 for write enable using deduplication
-  auto constantOne = getOrCreateConstant(funcOp.getOperation(), 1);
+  auto constantOne = getOrCreateConstant(componentOp.getOperation(), 1);
 
-  // Replace all uses of the scf.if result with the register output
-  ifResult.replaceAllUsesWith(resultReg.getOut());
+  // We'll replace the scf.if op at the end, not here
 
   // Replace yield operations with register assignments and group_done
   // operations Then region
@@ -232,16 +219,16 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
     auto &thenBlock = thenRegion.front();
     for (auto &op : llvm::make_early_inc_range(thenBlock)) {
       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-        OpBuilder builder(&op);
+        rewriter.setInsertionPoint(&op);
         // Create assignment: reg.in = thenYieldValue
-        builder.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
-                                        thenYieldValue, ifOp.getCondition());
+        rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
+                                         thenYieldValue, ifOp.getCondition());
         // Create assignment: reg.write_en = 1
-        builder.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
-                                        constantOne, ifOp.getCondition());
+        rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
+                                         constantOne, ifOp.getCondition());
         // Create group_done
-        builder.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
-        yieldOp.erase();
+        rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
+        rewriter.eraseOp(yieldOp);
       }
     }
   }
@@ -251,34 +238,33 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
     auto &elseBlock = elseRegion.front();
     for (auto &op : llvm::make_early_inc_range(elseBlock)) {
       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-        OpBuilder builder(&op);
-        // During scaffolding phase, we're still in a function, not a component
+        rewriter.setInsertionPoint(&op);
         // Create the NotLibOp at function level for now
         auto conditionType = condition.getType();
-        auto invertedCondition = functionBuilder.create<calyx::NotLibOp>(
+        auto invertedCondition = rewriter.create<calyx::NotLibOp>(
             ifOp.getLoc(), "inverted_cond_" + getOpUniqueName(ifOp),
             llvm::SmallVector<mlir::Type>{conditionType, conditionType});
-        builder.create<calyx::AssignOp>(op.getLoc(), invertedCondition.getIn(),
-                                        ifOp.getCondition());
+        rewriter.create<calyx::AssignOp>(op.getLoc(), invertedCondition.getIn(),
+                                         ifOp.getCondition());
         // Create assignment: reg.in = elseYieldValue
-        builder.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
-                                        elseYieldValue,
-                                        invertedCondition.getOut());
+        rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
+                                         elseYieldValue,
+                                         invertedCondition.getOut());
         // Create assignment: reg.write_en = 1
-        builder.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
-                                        constantOne,
-                                        invertedCondition.getOut());
+        rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
+                                         constantOne,
+                                         invertedCondition.getOut());
         // Create group_done
-        builder.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
-        yieldOp.erase();
+        rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
+        rewriter.eraseOp(yieldOp);
       }
     }
   }
 
   // Now replace the scf.if with calyx.if
-  OpBuilder builder(ifOp);
-  auto calyxIfOp = builder.create<calyx::IfOp>(ifOp.getLoc(), condition,
-                                               nullptr, !elseRegion.empty());
+  rewriter.setInsertionPoint(ifOp);
+  auto calyxIfOp = rewriter.create<calyx::IfOp>(ifOp.getLoc(), condition,
+                                                nullptr, !elseRegion.empty());
 
   // Move the then region operations to calyx.if then region
   if (!thenRegion.empty()) {
@@ -296,8 +282,9 @@ LogicalResult transformScfIfToCalyx(mlir::scf::IfOp ifOp,
                                           sourceElseBlock.getOperations());
   }
 
-  // Erase the original scf.if
-  ifOp.erase();
+  // Replace the scf.if with the calyx.if, providing the register output as the
+  // result
+  rewriter.replaceOp(ifOp, resultReg.getOut());
 
   return success();
 }
@@ -528,25 +515,28 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
   // Get block arguments from the for loop body
   Value inductionVar;
   llvm::SmallVector<Value> iterationArgs;
-  if (!forOp.getRegion().empty() && !forOp.getRegion().front().getArguments().empty()) {
+  if (!forOp.getRegion().empty() &&
+      !forOp.getRegion().front().getArguments().empty()) {
     auto &forBlock = forOp.getRegion().front();
     auto blockArgs = forBlock.getArguments();
-    
+
     // First argument is always the induction variable
     if (!blockArgs.empty()) {
       inductionVar = blockArgs[0];
     }
-    
+
     // Remaining arguments are iteration arguments (iter_args)
     for (unsigned i = 1; i < blockArgs.size(); ++i) {
       iterationArgs.push_back(blockArgs[i]);
     }
   }
 
-  // Determine bit width for constants - handle index type by using 32-bit default
+  // Determine bit width for constants - handle index type by using 32-bit
+  // default
   unsigned bitWidth = 32; // Default for index type
   if (inductionVar) {
-    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(inductionVar.getType())) {
+    if (auto intType =
+            mlir::dyn_cast<mlir::IntegerType>(inductionVar.getType())) {
       bitWidth = intType.getWidth();
     }
   }
@@ -569,8 +559,9 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
     auto counterRegOp = functionBuilder.create<calyx::RegisterOp>(
         forOp.getLoc(), counterName, inductionVar.getType());
     counterReg = counterRegOp.getOut();
-    
-    // llvm::errs() << "Created counter register with type: " << counterReg.getType() << "\n";
+
+    // llvm::errs() << "Created counter register with type: " <<
+    // counterReg.getType() << "\n";
 
     // We'll handle counter initialization in a separate initialization group
     // rather than continuous assignment to avoid conflicts
@@ -580,8 +571,9 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
   llvm::SmallVector<Value> iterArgRegs;
   for (unsigned i = 0; i < iterationArgs.size(); ++i) {
     functionBuilder.setInsertionPoint(wiresOp);
-    
-    std::string iterArgName = "for_iter_arg_" + std::to_string(i) + "_" + getOpUniqueName(forOp);
+
+    std::string iterArgName =
+        "for_iter_arg_" + std::to_string(i) + "_" + getOpUniqueName(forOp);
     auto iterArgRegOp = functionBuilder.create<calyx::RegisterOp>(
         forOp.getLoc(), iterArgName, iterationArgs[i].getType());
     iterArgRegs.push_back(iterArgRegOp.getOut());
@@ -593,14 +585,15 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
 
   // Replace with calyx.repeat
   OpBuilder builder(forOp);
-  
+
   // Initialize counter register before the repeat
   if (counterReg && inductionVar) {
-    auto initConstant = getOrCreateConstant(funcOp.getOperation(), lbValue, bitWidth);
+    auto initConstant =
+        getOrCreateConstant(funcOp.getOperation(), lbValue, bitWidth);
     auto counterRegOp = counterReg.getDefiningOp<calyx::RegisterOp>();
     if (counterRegOp) {
-      builder.create<calyx::AssignOp>(
-          forOp.getLoc(), counterRegOp.getIn(), initConstant);
+      builder.create<calyx::AssignOp>(forOp.getLoc(), counterRegOp.getIn(),
+                                      initConstant);
       builder.create<calyx::AssignOp>(
           forOp.getLoc(), counterRegOp.getWriteEn(),
           getOrCreateConstant(funcOp.getOperation(), 1, 1));
@@ -612,8 +605,8 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
   for (unsigned i = 0; i < iterArgRegs.size() && i < initArgs.size(); ++i) {
     auto iterArgRegOp = iterArgRegs[i].getDefiningOp<calyx::RegisterOp>();
     if (iterArgRegOp) {
-      builder.create<calyx::AssignOp>(
-          forOp.getLoc(), iterArgRegOp.getIn(), initArgs[i]);
+      builder.create<calyx::AssignOp>(forOp.getLoc(), iterArgRegOp.getIn(),
+                                      initArgs[i]);
       builder.create<calyx::AssignOp>(
           forOp.getLoc(), iterArgRegOp.getWriteEn(),
           getOrCreateConstant(funcOp.getOperation(), 1, 1));
@@ -629,14 +622,15 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
     auto &forBlock = forRegion.front();
     auto &repeatBlock = calyxRepeatOp.getBodyRegion().front();
 
-    // STEP 1: Replace all uses of block arguments with their corresponding registers
-    // Do this BEFORE moving any operations to avoid use-after-move issues
-    
+    // STEP 1: Replace all uses of block arguments with their corresponding
+    // registers Do this BEFORE moving any operations to avoid use-after-move
+    // issues
+
     // Replace induction variable with counter register
     if (inductionVar && counterReg) {
       replaceAllUsesInRegionWith(inductionVar, counterReg, forRegion);
     }
-    
+
     // Replace all iteration arguments with their corresponding registers
     for (unsigned i = 0; i < iterationArgs.size(); ++i) {
       if (i < iterArgRegs.size()) {
@@ -644,7 +638,8 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
       }
     }
 
-    // STEP 2: Extract yield values before moving operations (for iteration arg updates)
+    // STEP 2: Extract yield values before moving operations (for iteration arg
+    // updates)
     llvm::SmallVector<Value> yieldValues;
     for (auto &op : forBlock) {
       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
@@ -666,9 +661,10 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
 
     // Add update logic at the end of repeat body
     OpBuilder repeatBuilder(&repeatBlock, repeatBlock.end());
-    
+
     // Update iteration argument registers with yield values
-    for (unsigned i = 0; i < iterArgRegs.size() && i < yieldValues.size(); ++i) {
+    for (unsigned i = 0; i < iterArgRegs.size() && i < yieldValues.size();
+         ++i) {
       auto iterArgRegOp = iterArgRegs[i].getDefiningOp<calyx::RegisterOp>();
       if (iterArgRegOp && yieldValues[i]) {
         // Update iteration argument register with yield value
@@ -679,35 +675,43 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
             getOrCreateConstant(funcOp.getOperation(), 1, 1));
       }
     }
-    
+
     // If we created a counter, add increment logic at the end of repeat body
     if (counterReg && inductionVar) {
       // Create step constant using getOrCreateConstant
-      auto stepConstantValue = getOrCreateConstant(funcOp.getOperation(), stepValue, bitWidth);
-      
+      auto stepConstantValue =
+          getOrCreateConstant(funcOp.getOperation(), stepValue, bitWidth);
+
       // Create add operation for counter increment
       // Need to create AddLibOp as a component-level operation
       auto componentOp = forOp->getParentOfType<calyx::ComponentOp>();
       if (componentOp) {
         auto wiresOp = componentOp.getWiresOp();
         OpBuilder componentBuilder(wiresOp);
-        
+
         std::string addOpName = "for_counter_add_" + getOpUniqueName(forOp);
-        SmallVector<Type> addResultTypes = {inductionVar.getType(), inductionVar.getType(), inductionVar.getType()};
+        SmallVector<Type> addResultTypes = {inductionVar.getType(),
+                                            inductionVar.getType(),
+                                            inductionVar.getType()};
         // Create AddLibOp for counter increment
         auto addOp = componentBuilder.create<calyx::AddLibOp>(
-            forOp.getLoc(), componentBuilder.getStringAttr(addOpName), addResultTypes);
-        
+            forOp.getLoc(), componentBuilder.getStringAttr(addOpName),
+            addResultTypes);
+
         // Connect the add operation inputs in wires
         auto &wiresBlock = wiresOp.getBodyRegion().front();
         OpBuilder addWiresBuilder(&wiresBlock, wiresBlock.end());
-        addWiresBuilder.create<calyx::AssignOp>(forOp.getLoc(), addOp.getLeft(), counterReg);
-        addWiresBuilder.create<calyx::AssignOp>(forOp.getLoc(), addOp.getRight(), stepConstantValue);
-        
-        // Assign the incremented value back to the counter register in the repeat body
+        addWiresBuilder.create<calyx::AssignOp>(forOp.getLoc(), addOp.getLeft(),
+                                                counterReg);
+        addWiresBuilder.create<calyx::AssignOp>(
+            forOp.getLoc(), addOp.getRight(), stepConstantValue);
+
+        // Assign the incremented value back to the counter register in the
+        // repeat body
         auto counterRegOp = counterReg.getDefiningOp<calyx::RegisterOp>();
         if (counterRegOp) {
-          // Make sure we're using the correct addOp output (should be index type)
+          // Make sure we're using the correct addOp output (should be index
+          // type)
           repeatBuilder.create<calyx::AssignOp>(
               forOp.getLoc(), counterRegOp.getIn(), addOp.getOut());
           repeatBuilder.create<calyx::AssignOp>(
@@ -718,16 +722,20 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
     }
   }
 
-  // If the for loop had results, replace them with the final iteration argument register values
+  // If the for loop had results, replace them with the final iteration argument
+  // register values
   for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
     auto forResult = forOp.getResult(i);
-    
-    // The for loop result corresponds to the final value of the i-th iteration argument
+
+    // The for loop result corresponds to the final value of the i-th iteration
+    // argument
     if (i < iterArgRegs.size()) {
-      // Replace all uses of the for result with the iteration argument register output
+      // Replace all uses of the for result with the iteration argument register
+      // output
       forResult.replaceAllUsesWith(iterArgRegs[i]);
     } else {
-      // Fallback: create a temporary register if we don't have enough iter arg registers
+      // Fallback: create a temporary register if we don't have enough iter arg
+      // registers
       auto &entryBlock = funcOp.front();
       auto wiresOps = entryBlock.getOps<calyx::WiresOp>();
       if (!wiresOps.empty()) {
@@ -735,7 +743,8 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
         functionBuilder.setInsertionPoint(wiresOp);
       }
 
-      std::string regName = "for_result_" + std::to_string(i) + "_" + getOpUniqueName(forOp);
+      std::string regName =
+          "for_result_" + std::to_string(i) + "_" + getOpUniqueName(forOp);
       auto resultReg = functionBuilder.create<calyx::RegisterOp>(
           forOp.getLoc(), regName, forResult.getType());
 
