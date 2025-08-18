@@ -21,6 +21,60 @@ using namespace mlir;
 namespace circt {
 namespace lowertocalyx {
 
+static void storeLowering(mlir::ConversionPatternRewriter &rewriter,
+                          mlir::memref::StoreOp &storeOp,
+                          circt::calyx::SeqMemoryOp &memOp,
+                          const mlir::TypeConverter *typeConverter,
+                          const mlir::Location &loc,
+                          const circt::calyx::WiresOp &wiresOp,
+                          mlir::func::FuncOp &op) {
+  // Use only the ConversionPatternRewriter to avoid insertion point conflicts
+  rewriter.setInsertionPointAfter(storeOp);
+
+  Value addrPort = memOp.addrPort(0);
+  Value indexValue = storeOp.getIndices()[0];
+
+  // Simplified approach: just assign index value directly to address port
+  // The conversion framework will handle type conversion later in the pipeline
+  rewriter.create<calyx::AssignOp>(loc, addrPort, indexValue);
+  rewriter.create<calyx::AssignOp>(loc, memOp.writeData(),
+                                   storeOp.getValueToStore());
+
+  // Create constant 1 for contentEn
+  auto constantOp = rewriter.create<hw::ConstantOp>(
+      loc, rewriter.getIntegerAttr(rewriter.getI1Type(), 1));
+  rewriter.create<calyx::AssignOp>(loc, memOp.contentEn(),
+                                   constantOp.getResult());
+
+  rewriter.eraseOp(storeOp);
+}
+
+static void loadLowering(mlir::ConversionPatternRewriter &rewriter,
+                         mlir::memref::LoadOp &loadOp,
+                         circt::calyx::SeqMemoryOp &memOp,
+                         const mlir::TypeConverter *typeConverter,
+                         const mlir::Location &loc,
+                         const circt::calyx::WiresOp &wiresOp,
+                         mlir::func::FuncOp &op) {
+  // Use only the ConversionPatternRewriter to avoid insertion point conflicts
+  rewriter.setInsertionPointAfter(loadOp);
+
+  Value addrPort = memOp.addrPort(0);
+  Value indexValue = loadOp.getIndices()[0];
+
+  // Simplified approach: just assign index value directly to address port
+  // The conversion framework will handle type conversion later in the pipeline
+  rewriter.create<calyx::AssignOp>(loc, addrPort, indexValue);
+
+  // Create constant 1 for contentEn
+  auto constantOp = rewriter.create<hw::ConstantOp>(
+      loc, rewriter.getIntegerAttr(rewriter.getI1Type(), 1));
+  rewriter.create<calyx::AssignOp>(loc, memOp.contentEn(),
+                                   constantOp.getResult());
+
+  rewriter.replaceOp(loadOp, memOp.readData());
+}
+
 LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
     mlir::func::FuncOp op, mlir::func::FuncOpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
@@ -120,142 +174,23 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
       if (op.getArgument(i).getNumUses() == 1) {
         auto use = op.getArgument(i).getUses().begin();
         if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(use->getOwner())) {
-          OpBuilder loadBuilder(rewriter.getContext());
-          loadBuilder.setInsertionPointAfter(loadOp);
-
-          // TODO: Handle type conversion for address port assignment
-          // For now, skip type conversion to get basic structure working
-          Value addrPort = memOp.addrPort(0);
-          Value indexValue = loadOp.getIndices()[0];
-
-          // Convert index value using type converter first
-          // The type converter converts index to i32
-          Value convertedIndexValue = indexValue;
-          if (indexValue.getType().isIndex()) {
-            // Create cast from index to i32 as expected by type converter
-            auto i32Type = rewriter.getI32Type();
-            convertedIndexValue = rewriter
-                                      .create<UnrealizedConversionCastOp>(
-                                          loc, i32Type, indexValue)
-                                      .getResult(0);
-          }
-
-          // Use utility function for address port type conversion
-          Value convertedAddr = convertValueForToMatchType(
-              addrPort, convertedIndexValue, wiresOp, loadBuilder,
-              getOpUniqueName(loadOp.getOperation()), loc, rewriter);
-          loadBuilder.create<calyx::AssignOp>(loc, addrPort, convertedAddr);
-          // Note: Don't need to assign to loadOp.getResult() - we replace the
-          // entire operation
-          auto true_value = getOrCreateConstant(op, 1);
-          loadBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
-                                              true_value);
-          loadOp.replaceAllUsesWith(memOp.readData());
-          loadOp.erase();
-
+          loadLowering(rewriter, loadOp, memOp, typeConverter, loc, wiresOp,
+                       op);
         } else if (auto storeOp =
                        dyn_cast<mlir::memref::StoreOp>(use->getOwner())) {
-          OpBuilder storeBuilder(rewriter.getContext());
-          storeBuilder.setInsertionPointAfter(storeOp);
-
-          // TODO: Handle type conversion for address port assignment
-          // For now, skip type conversion to get basic structure working
-          Value addrPort = memOp.addrPort(0);
-          Value indexValue = storeOp.getIndices()[0];
-
-          // Convert index value using type converter first
-          // The type converter converts index to i32
-          Value convertedIndexValue = indexValue;
-          if (indexValue.getType().isIndex()) {
-            // Create cast from index to i32 as expected by type converter
-            auto i32Type = rewriter.getI32Type();
-            convertedIndexValue = rewriter
-                                      .create<UnrealizedConversionCastOp>(
-                                          loc, i32Type, indexValue)
-                                      .getResult(0);
-          }
-
-          // Use utility function for address port type conversion
-          Value convertedAddr = convertValueForToMatchType(
-              addrPort, convertedIndexValue, wiresOp, storeBuilder,
-              getOpUniqueName(storeOp.getOperation()), loc, rewriter);
-          storeBuilder.create<calyx::AssignOp>(loc, addrPort, convertedAddr);
-          storeBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
-                                               storeOp.getValueToStore());
-          auto true_value = getOrCreateConstant(op, 1);
-          storeBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
-                                               true_value);
-          storeOp.erase();
+          storeLowering(rewriter, storeOp, memOp, typeConverter, loc, wiresOp,
+                        op);
         }
       } else {
         for (auto &use : op.getArgument(i).getUses()) {
           if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(use.getOwner())) {
-            OpBuilder loadBuilder(rewriter.getContext());
-            loadBuilder.setInsertionPointAfter(loadOp);
-
-            // TODO: Handle type conversion for address port assignment
-            // For now, skip type conversion to get basic structure working
-            Value addrPort = memOp.addrPort(0);
-            Value indexValue = loadOp.getIndices()[0];
-
-            // Convert index value using type converter first
-            Type convertedIndexType =
-                typeConverter->convertType(indexValue.getType());
-            Value convertedIndexValue = indexValue;
-            if (convertedIndexType &&
-                convertedIndexType != indexValue.getType()) {
-              convertedIndexValue = rewriter
-                                        .create<UnrealizedConversionCastOp>(
-                                            loc, convertedIndexType, indexValue)
-                                        .getResult(0);
-            }
-
-            // Use utility function for address port type conversion
-            Value convertedAddr = convertValueForToMatchType(
-                addrPort, convertedIndexValue, wiresOp, loadBuilder,
-                getOpUniqueName(loadOp.getOperation()), loc, rewriter);
-            loadBuilder.create<calyx::AssignOp>(loc, addrPort, convertedAddr);
-            // Note: Don't need to assign to loadOp.getResult() - we replace the
-            // entire operation
-            auto true_value = getOrCreateConstant(op, 1);
-            loadBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
-                                                true_value);
-            loadOp.replaceAllUsesWith(memOp.readData());
-            loadOp.erase();
+            loadLowering(rewriter, loadOp, memOp, typeConverter, loc, wiresOp,
+                         op);
 
           } else if (auto storeOp =
                          dyn_cast<mlir::memref::StoreOp>(use.getOwner())) {
-            OpBuilder storeBuilder(rewriter.getContext());
-            storeBuilder.setInsertionPointAfter(storeOp);
-
-            // TODO: Handle type conversion for address port assignment
-            // For now, skip type conversion to get basic structure working
-            Value addrPort = memOp.addrPort(0);
-            Value indexValue = storeOp.getIndices()[0];
-
-            // Convert index value using type converter first
-            Type convertedIndexType =
-                typeConverter->convertType(indexValue.getType());
-            Value convertedIndexValue = indexValue;
-            if (convertedIndexType &&
-                convertedIndexType != indexValue.getType()) {
-              convertedIndexValue = rewriter
-                                        .create<UnrealizedConversionCastOp>(
-                                            loc, convertedIndexType, indexValue)
-                                        .getResult(0);
-            }
-
-            // Use utility function for address port type conversion
-            Value convertedAddr = convertValueForToMatchType(
-                addrPort, convertedIndexValue, wiresOp, storeBuilder,
-                getOpUniqueName(storeOp.getOperation()), loc, rewriter);
-            storeBuilder.create<calyx::AssignOp>(loc, addrPort, convertedAddr);
-            storeBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
-                                                 storeOp.getValueToStore());
-            auto true_value = getOrCreateConstant(op, 1);
-            storeBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(),
-                                                 true_value);
-            storeOp.erase();
+            storeLowering(rewriter, storeOp, memOp, typeConverter, loc, wiresOp,
+                          op);
           }
         }
       }
