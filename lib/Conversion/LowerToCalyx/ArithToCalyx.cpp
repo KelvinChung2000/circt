@@ -411,56 +411,33 @@ template struct ArithComparisonOpToCalyxPattern<mlir::arith::CmpIOp,
 LogicalResult ArithIndexCastToCalyxPattern::matchAndRewrite(
     mlir::arith::IndexCastOp op, mlir::arith::IndexCastOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
-
-  // Follow SCFToCalyx approach exactly
+  // Normalize to integer types for bitwidth reasoning.
   Type sourceType = calyx::normalizeType(rewriter, op.getOperand().getType());
   Type targetType = calyx::normalizeType(rewriter, op.getResult().getType());
   unsigned targetBits = targetType.getIntOrFloatBitWidth();
   unsigned sourceBits = sourceType.getIntOrFloatBitWidth();
 
-  if (targetBits == sourceBits) {
-    // Drop the index cast and replace uses of the target value with the source
-    // value.
-    op.getResult().replaceAllUsesWith(op.getOperand());
-  } else {
-    // Create Calyx library operations following the same pattern as other arith
-    // ops
-    auto loc = op.getLoc();
-    std::string symName = getOpUniqueName(op);
+  auto loc = op.getLoc();
+  Value inVal = adaptor.getIn();
+  if (!inVal)
+    return rewriter.notifyMatchFailure(op, "IndexCast adaptor operand is null");
 
-    // Create result types for the library operation
-    SmallVector<Type> resultTypes = {calyx::toBitVector(sourceType),
-                                     calyx::toBitVector(targetType)};
-
-    // Find the parent component to create library operations at the component
-    // level
-    calyx::ComponentOp topLevelOp = op->getParentOfType<calyx::ComponentOp>();
-    auto wiresOp = topLevelOp.getWiresOp();
-
-    // Create the library operation inside the wires operation
-    OpBuilder componentBuilder(wiresOp);
-    auto &wiresBlock = wiresOp.getBodyRegion().front();
-    OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
-
-    if (sourceBits > targetBits) {
-      // Truncation: use SliceLibOp
-      auto sliceOp = componentBuilder.create<calyx::SliceLibOp>(
-          loc, componentBuilder.getStringAttr(symName), resultTypes);
-
-      wiresBuilder.create<calyx::AssignOp>(loc, sliceOp.getIn(), op.getIn());
-      // Replace uses with the output port (second result)
-      op.getResult().replaceAllUsesWith(sliceOp.getOut());
-    } else {
-      // Extension: use PadLibOp
-      auto padOp = componentBuilder.create<calyx::PadLibOp>(
-          loc, componentBuilder.getStringAttr(symName), resultTypes);
-
-      wiresBuilder.create<calyx::AssignOp>(loc, padOp.getIn(), op.getIn());
-      // Replace uses with the output port (second result)
-      op.getResult().replaceAllUsesWith(padOp.getOut());
-    }
+  if (sourceBits == targetBits) {
+    rewriter.replaceOp(op, inVal);
+    return success();
   }
-  rewriter.eraseOp(op);
+
+  // Re-express index_cast as ext/trunc arith op; existing patterns lower
+  // those to PadLibOp / SliceLibOp.
+  if (sourceBits < targetBits) {
+    auto newType = IntegerType::get(op.getContext(), targetBits);
+    auto ext = rewriter.create<arith::ExtSIOp>(loc, newType, inVal);
+    rewriter.replaceOp(op, ext.getResult());
+  } else {
+    auto newType = IntegerType::get(op.getContext(), targetBits);
+    auto trunc = rewriter.create<arith::TruncIOp>(loc, newType, inVal);
+    rewriter.replaceOp(op, trunc.getResult());
+  }
   return success();
 }
 

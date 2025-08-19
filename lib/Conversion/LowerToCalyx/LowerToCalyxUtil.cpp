@@ -521,8 +521,8 @@ mlir::Value createReg(mlir::Operation *parentOp, mlir::Type type,
   return regOp.getOut();
 }
 
-/// Converts a value to match the target address port type using Calyx
-/// SliceLibOp
+/// Converts rhs to match lhs type (address port) using optional index cast,
+/// and Calyx PadLibOp/SliceLibOp for extend/truncate. Returns adapted value.
 Value convertValueForToMatchType(Value lhs, Value rhs, calyx::WiresOp wiresOp,
                                  OpBuilder &wiresBuilder, StringRef uniqueName,
                                  Location loc,
@@ -530,49 +530,53 @@ Value convertValueForToMatchType(Value lhs, Value rhs, calyx::WiresOp wiresOp,
   Type lhsType = lhs.getType();
   Type rhsType = rhs.getType();
 
-  // Continue with the original logic
-
-  // If types already match, return original value
-  if (lhsType == rhsType) {
-    return rhs;
+  // If rhs is index and lhs is integer, first cast to i32.
+  if (rhsType.isIndex() && isa<IntegerType>(lhsType)) {
+    rhs = rewriter.create<mlir::arith::IndexCastOp>(loc, rewriter.getI32Type(),
+                                                    rhs);
+    rhsType = rhs.getType();
   }
 
-  // Both should be integer types for address ports
-  auto addrIntType = dyn_cast<IntegerType>(lhsType);
-  auto indexIntType = dyn_cast<IntegerType>(rhsType);
-
-  if (!addrIntType || !indexIntType) {
-    // Can't convert non-integer types, return original
+  if (lhsType == rhsType)
     return rhs;
-  }
 
-  unsigned addrWidth = addrIntType.getWidth();
-  unsigned indexWidth = indexIntType.getWidth();
+  auto dstInt = dyn_cast<IntegerType>(lhsType);
+  auto srcInt = dyn_cast<IntegerType>(rhsType);
+  if (!dstInt || !srcInt)
+    return rhs; // Non-integer adaptation unsupported here.
 
-  if (addrWidth >= indexWidth) {
-    // Address port is wider or same size, no conversion needed
+  unsigned dstW = dstInt.getWidth();
+  unsigned srcW = srcInt.getWidth();
+  if (dstW == srcW)
     return rhs;
-  }
 
-  // Need to truncate indexValue to fit address port
-  // Use Calyx SliceLibOp (following the exact pattern from ArithToCalyx.cpp)
-  std::string sliceName = ("slice_addr_" + uniqueName).str();
+  bool needExtend = srcW < dstW;
+  SmallVector<Type> libTypes = {rhsType, lhsType};
 
-  // Create slice operation at component level (before wires section)
-  OpBuilder::InsertionGuard sliceGuard(rewriter);
+  // Insert library op at component/wires op level (just before wiresOp).
+  OpBuilder::InsertionGuard g1(rewriter);
   rewriter.setInsertionPoint(wiresOp);
+  Operation *libOp = nullptr;
+  if (needExtend) {
+    libOp = rewriter.create<calyx::PadLibOp>(
+        loc, rewriter.getStringAttr((Twine("pad_addr_") + uniqueName).str()),
+        libTypes);
+  } else {
+    libOp = rewriter.create<calyx::SliceLibOp>(
+        loc, rewriter.getStringAttr((Twine("slice_addr_") + uniqueName).str()),
+        libTypes);
+  }
 
-  // SliceLibOp takes input type and output type (following ArithToCalyx pattern)
-  SmallVector<Type> sliceTypes = {rhsType, lhsType};
-  auto sliceOp = rewriter.create<calyx::SliceLibOp>(
-      loc, rewriter.getStringAttr(sliceName), sliceTypes);
-
-  // Assign input to slice operation in wires section
-  OpBuilder::InsertionGuard wiresGuard(wiresBuilder);
+  // Connect input in wires region.
+  OpBuilder::InsertionGuard g2(wiresBuilder);
   wiresBuilder.setInsertionPointToEnd(wiresOp.getBodyBlock());
-  wiresBuilder.create<calyx::AssignOp>(loc, sliceOp.getIn(), rhs);
+  auto inAttr = needExtend ? dyn_cast<calyx::PadLibOp>(libOp).getIn()
+                           : dyn_cast<calyx::SliceLibOp>(libOp).getIn();
+  wiresBuilder.create<calyx::AssignOp>(loc, inAttr, rhs);
 
-  return sliceOp.getOut();
+  Value outVal = needExtend ? dyn_cast<calyx::PadLibOp>(libOp).getOut()
+                            : dyn_cast<calyx::SliceLibOp>(libOp).getOut();
+  return outVal;
 }
 
 } // namespace lowertocalyx

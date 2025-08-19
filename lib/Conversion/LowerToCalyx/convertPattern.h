@@ -1,6 +1,7 @@
 #ifndef CIRCT_CONVERSION_LOWERTOCALYX_CONVERTPATTERN_H
 #define CIRCT_CONVERSION_LOWERTOCALYX_CONVERTPATTERN_H
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -298,6 +299,22 @@ public:
   matchAndRewrite(mlir::scf::IfOp ifOp, mlir::scf::IfOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
 };
+
+/// SCF control flow patterns
+/// Pattern to convert SCF for operations to Calyx repeat operations
+class ScfForToCalyxPattern : public OpConversionPattern<mlir::scf::ForOp> {
+public:
+  using OpConversionPattern<mlir::scf::ForOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mlir::scf::ForOp forOp, mlir::scf::ForOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+/// Affine control flow patterns
+/// Pattern to convert affine for operations to Calyx repeat operations
+// AffineForToCalyxPattern removed - input should only contain scf.for, not
+// affine.for
 
 } // namespace lowertocalyx
 } // namespace circt

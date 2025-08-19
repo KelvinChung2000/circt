@@ -15,6 +15,7 @@
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "convertPattern.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
@@ -27,9 +28,6 @@
 using namespace circt;
 using namespace circt::lowertocalyx;
 using namespace mlir;
-
-// Forward declaration from LowerToCalyx.cpp
-std::string getOpUniqueName(mlir::Operation *op);
 
 namespace circt {
 namespace lowertocalyx {
@@ -290,6 +288,281 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
   return success();
 }
 
+// SCF for to Calyx conversion pattern implementation
+LogicalResult ScfForToCalyxPattern::matchAndRewrite(
+    mlir::scf::ForOp forOp, mlir::scf::ForOp::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+
+  // SCF patterns run AFTER function-to-component conversion, so we should be in
+  // a component context
+  auto componentOp = forOp->getParentOfType<calyx::ComponentOp>();
+  if (!componentOp) {
+    return rewriter.notifyMatchFailure(forOp, "scf.for not within a component");
+  }
+
+  calyx::WiresOp wiresOp = componentOp.getWiresOp();
+  if (!wiresOp) {
+    return rewriter.notifyMatchFailure(forOp, "No WiresOp found in component");
+  }
+
+  // Use the enhanced SCF for conversion logic directly instead of the old
+  // transformScfForToCalyx Extract constant bounds
+  auto lbConstant =
+      forOp.getLowerBound().getDefiningOp<mlir::arith::ConstantOp>();
+  auto ubConstant =
+      forOp.getUpperBound().getDefiningOp<mlir::arith::ConstantOp>();
+  auto stepConstant = forOp.getStep().getDefiningOp<mlir::arith::ConstantOp>();
+
+  if (!lbConstant || !ubConstant || !stepConstant) {
+    return rewriter.notifyMatchFailure(
+        forOp, "Only constant-bound for loops are supported");
+  }
+
+  // Extract constant values
+  auto lbIntAttr = mlir::dyn_cast<mlir::IntegerAttr>(lbConstant.getValue());
+  auto ubIntAttr = mlir::dyn_cast<mlir::IntegerAttr>(ubConstant.getValue());
+  auto stepIntAttr = mlir::dyn_cast<mlir::IntegerAttr>(stepConstant.getValue());
+
+  if (!lbIntAttr || !ubIntAttr || !stepIntAttr) {
+    return rewriter.notifyMatchFailure(
+        forOp, "Non-integer constant bounds in for loop");
+  }
+
+  auto lbValue = lbIntAttr.getInt();
+  auto ubValue = ubIntAttr.getInt();
+  auto stepValue = stepIntAttr.getInt();
+
+  // Calculate iteration count
+  if (stepValue <= 0 || ubValue <= lbValue) {
+    return rewriter.notifyMatchFailure(forOp, "Invalid for loop bounds");
+  }
+
+  int64_t count = (ubValue - lbValue + stepValue - 1) / stepValue;
+
+  // Get block arguments from the for loop body
+  Value inductionVar;
+  llvm::SmallVector<Value> iterationArgs;
+  if (!forOp.getRegion().empty() &&
+      !forOp.getRegion().front().getArguments().empty()) {
+    auto &forBlock = forOp.getRegion().front();
+    auto blockArgs = forBlock.getArguments();
+
+    // First argument is always the induction variable
+    if (!blockArgs.empty()) {
+      inductionVar = blockArgs[0];
+    }
+
+    // Remaining arguments are iteration arguments (iter_args)
+    for (unsigned i = 1; i < blockArgs.size(); ++i) {
+      iterationArgs.push_back(blockArgs[i]);
+    }
+  }
+
+  // Determine bit width for constants - handle index type by using 32-bit
+  // default
+  unsigned bitWidth = 32; // Default for index type
+  if (inductionVar) {
+    // For unused utility function, just use i32 as default
+    Type convertedType = IntegerType::get(forOp.getContext(), 32);
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(convertedType)) {
+      bitWidth = intType.getWidth();
+    }
+  }
+
+  // Create a counter register to replace the induction variable
+  OpBuilder componentBuilder(wiresOp);
+  auto &wiresBlock = wiresOp.getBodyRegion().front();
+  OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
+
+  Value counterReg;
+  if (inductionVar) {
+    std::string counterName = "for_counter_" + getOpUniqueName(forOp);
+    // Use type converter to convert index to i32
+    Type convertedType =
+        this->getTypeConverter()->convertType(inductionVar.getType());
+    auto counterRegOp = componentBuilder.create<calyx::RegisterOp>(
+        forOp.getLoc(), counterName, convertedType);
+    counterReg = counterRegOp.getOut();
+  }
+
+  // Create registers for all iteration arguments
+  llvm::SmallVector<Value> iterArgRegs;
+  for (unsigned i = 0; i < iterationArgs.size(); ++i) {
+    std::string iterArgName =
+        "for_iter_arg_" + std::to_string(i) + "_" + getOpUniqueName(forOp);
+    auto iterArgRegOp = componentBuilder.create<calyx::RegisterOp>(
+        forOp.getLoc(), iterArgName, iterationArgs[i].getType());
+    iterArgRegs.push_back(iterArgRegOp.getOut());
+  }
+
+  // Initialize counter register
+  if (counterReg && inductionVar) {
+    auto initConstant =
+        getOrCreateConstant(componentOp.getOperation(), lbValue, bitWidth);
+    auto counterRegOp = counterReg.getDefiningOp<calyx::RegisterOp>();
+    if (counterRegOp) {
+      rewriter.create<calyx::AssignOp>(forOp.getLoc(), counterRegOp.getIn(),
+                                       initConstant);
+      rewriter.create<calyx::AssignOp>(
+          forOp.getLoc(), counterRegOp.getWriteEn(),
+          getOrCreateConstant(componentOp.getOperation(), 1, 1));
+    }
+  }
+
+  // Initialize iteration argument registers with their initial values
+  auto initArgs = forOp.getInitArgs();
+  for (unsigned i = 0; i < iterArgRegs.size() && i < initArgs.size(); ++i) {
+    auto iterArgRegOp = iterArgRegs[i].getDefiningOp<calyx::RegisterOp>();
+    if (iterArgRegOp) {
+      rewriter.create<calyx::AssignOp>(forOp.getLoc(), iterArgRegOp.getIn(),
+                                       initArgs[i]);
+      rewriter.create<calyx::AssignOp>(
+          forOp.getLoc(), iterArgRegOp.getWriteEn(),
+          getOrCreateConstant(componentOp.getOperation(), 1, 1));
+    }
+  }
+
+  // // Add a single group done signal to the initialization group
+  // Value lastDoneSignal = nullptr;
+  // if (counterReg) {
+  //   auto counterRegOp = counterReg.getDefiningOp<calyx::RegisterOp>();
+  //   if (counterRegOp) {
+  //     lastDoneSignal = counterRegOp.getDone();
+  //   }
+  // } else if (!iterArgRegs.empty()) {
+  //   auto iterArgRegOp = iterArgRegs[0].getDefiningOp<calyx::RegisterOp>();
+  //   if (iterArgRegOp) {
+  //     lastDoneSignal = iterArgRegOp.getDone();
+  //   }
+  // }
+
+  // if (lastDoneSignal) {
+  //   rewriter.create<calyx::GroupDoneOp>(forOp.getLoc(), lastDoneSignal);
+  // }
+
+  // Create the calyx.repeat operation
+  auto calyxRepeatOp = rewriter.create<calyx::RepeatOp>(
+      forOp.getLoc(), static_cast<uint32_t>(count));
+
+  // Process the for loop body
+  auto &forRegion = forOp.getRegion();
+  if (!forRegion.empty()) {
+    auto &forBlock = forRegion.front();
+    auto &repeatBlock = calyxRepeatOp.getBodyRegion().front();
+
+    // STEP 1: Replace all uses of block arguments with their corresponding
+    // registers
+    if (inductionVar && counterReg) {
+      replaceAllUsesInRegionWith(inductionVar, counterReg, forRegion);
+    }
+
+    for (unsigned i = 0; i < iterationArgs.size(); ++i) {
+      if (i < iterArgRegs.size()) {
+        replaceAllUsesInRegionWith(iterationArgs[i], iterArgRegs[i], forRegion);
+      }
+    }
+
+    // STEP 2: Extract yield values before moving operations
+    llvm::SmallVector<Value> yieldValues;
+    for (auto &op : forBlock) {
+      if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
+        for (unsigned i = 0; i < yieldOp.getNumOperands(); ++i) {
+          yieldValues.push_back(yieldOp.getOperand(i));
+        }
+        break;
+      }
+    }
+
+    // STEP 3: Move all operations except the yield
+    for (auto &op : llvm::make_early_inc_range(forBlock)) {
+      if (isa<mlir::scf::YieldOp>(op)) {
+        rewriter.eraseOp(&op); // Remove yield as Calyx repeat doesn't need it
+        continue;
+      }
+      op.moveBefore(&repeatBlock, repeatBlock.end());
+    }
+
+    // Add update logic at the end of repeat body
+    OpBuilder repeatBuilder(&repeatBlock, repeatBlock.end());
+
+    // Update iteration argument registers with yield values
+    for (unsigned i = 0; i < iterArgRegs.size() && i < yieldValues.size();
+         ++i) {
+      auto iterArgRegOp = iterArgRegs[i].getDefiningOp<calyx::RegisterOp>();
+      if (iterArgRegOp && yieldValues[i]) {
+        repeatBuilder.create<calyx::AssignOp>(
+            forOp.getLoc(), iterArgRegOp.getIn(), yieldValues[i]);
+        repeatBuilder.create<calyx::AssignOp>(
+            forOp.getLoc(), iterArgRegOp.getWriteEn(),
+            getOrCreateConstant(componentOp.getOperation(), 1, 1));
+        // Done signal handled by repeat operation
+      }
+    }
+
+    // If we created a counter, add increment logic at the end of repeat body
+    if (counterReg && inductionVar) {
+      // Create step constant
+      auto stepConstantValue =
+          getOrCreateConstant(componentOp.getOperation(), stepValue, bitWidth);
+
+      // Create add operation for counter increment
+      std::string addOpName = "for_counter_add_" + getOpUniqueName(forOp);
+      // Use converted type for add operation
+      Type convertedType =
+          this->getTypeConverter()->convertType(inductionVar.getType());
+      SmallVector<Type> addResultTypes = {convertedType, convertedType,
+                                          convertedType};
+
+      auto addOp = componentBuilder.create<calyx::AddLibOp>(
+          forOp.getLoc(), rewriter.getStringAttr(addOpName), addResultTypes);
+
+      // Connect the add operation inputs in wires
+      wiresBuilder.create<calyx::AssignOp>(forOp.getLoc(), addOp.getLeft(),
+                                           counterReg);
+      wiresBuilder.create<calyx::AssignOp>(forOp.getLoc(), addOp.getRight(),
+                                           stepConstantValue);
+
+      // Assign the incremented value back to the counter register in the repeat
+      // body
+      auto counterRegOp = counterReg.getDefiningOp<calyx::RegisterOp>();
+      if (counterRegOp) {
+        repeatBuilder.create<calyx::AssignOp>(
+            forOp.getLoc(), counterRegOp.getIn(), addOp.getOut());
+        repeatBuilder.create<calyx::AssignOp>(
+            forOp.getLoc(), counterRegOp.getWriteEn(),
+            getOrCreateConstant(componentOp.getOperation(), 1, 1));
+        // Done signal handled by repeat operation
+      }
+    }
+  }
+
+  // If the for loop had results, replace them with the final iteration argument
+  // register values
+  for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
+    auto forResult = forOp.getResult(i);
+
+    if (i < iterArgRegs.size()) {
+      // Replace all uses of the for result with the iteration argument register
+      // output
+      forResult.replaceAllUsesWith(iterArgRegs[i]);
+    } else {
+      // Fallback: create a temporary register if we don't have enough iter arg
+      // registers
+      rewriter.setInsertionPoint(wiresOp);
+      std::string regName =
+          "for_result_" + std::to_string(i) + "_" + getOpUniqueName(forOp);
+      auto resultReg = rewriter.create<calyx::RegisterOp>(
+          forOp.getLoc(), regName, forResult.getType());
+      forResult.replaceAllUsesWith(resultReg.getOut());
+    }
+  }
+
+  // Erase the original for loop
+  rewriter.eraseOp(forOp);
+
+  return success();
+}
+
 // Helper function to check if a group only contains done signals
 static bool groupOnlyHasDone(calyx::GroupOp groupOp) {
   auto *groupBlock = groupOp.getBodyBlock();
@@ -536,8 +809,9 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
   // default
   unsigned bitWidth = 32; // Default for index type
   if (inductionVar) {
-    if (auto intType =
-            mlir::dyn_cast<mlir::IntegerType>(inductionVar.getType())) {
+    // For unused utility function, just use i32 as default
+    Type convertedType = IntegerType::get(forOp.getContext(), 32);
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(convertedType)) {
       bitWidth = intType.getWidth();
     }
   }
@@ -557,8 +831,12 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
 
     // Create a counter register with the same type as the induction variable
     std::string counterName = "for_counter_" + getOpUniqueName(forOp);
+    // Use default i32 type for index in utility function
+    Type convertedType = inductionVar.getType().isIndex()
+                             ? IntegerType::get(forOp.getContext(), 32)
+                             : inductionVar.getType();
     auto counterRegOp = functionBuilder.create<calyx::RegisterOp>(
-        forOp.getLoc(), counterName, inductionVar.getType());
+        forOp.getLoc(), counterName, convertedType);
     counterReg = counterRegOp.getOut();
 
     // llvm::errs() << "Created counter register with type: " <<
@@ -691,9 +969,11 @@ LogicalResult transformScfForToCalyx(mlir::scf::ForOp forOp,
         OpBuilder componentBuilder(wiresOp);
 
         std::string addOpName = "for_counter_add_" + getOpUniqueName(forOp);
-        SmallVector<Type> addResultTypes = {inductionVar.getType(),
-                                            inductionVar.getType(),
-                                            inductionVar.getType()};
+        // Use converted type for add operation
+        // For unused utility function, just use i32 as default
+        Type convertedType = IntegerType::get(forOp.getContext(), 32);
+        SmallVector<Type> addResultTypes = {convertedType, convertedType,
+                                            convertedType};
         // Create AddLibOp for counter increment
         auto addOp = componentBuilder.create<calyx::AddLibOp>(
             forOp.getLoc(), componentBuilder.getStringAttr(addOpName),

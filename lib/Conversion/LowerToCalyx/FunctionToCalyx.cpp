@@ -24,54 +24,46 @@ namespace lowertocalyx {
 static void storeLowering(mlir::ConversionPatternRewriter &rewriter,
                           mlir::memref::StoreOp &storeOp,
                           circt::calyx::SeqMemoryOp &memOp,
-                          const mlir::TypeConverter *typeConverter,
                           const mlir::Location &loc,
-                          const circt::calyx::WiresOp &wiresOp,
-                          mlir::func::FuncOp &op) {
-  // Use only the ConversionPatternRewriter to avoid insertion point conflicts
-  rewriter.setInsertionPointAfter(storeOp);
+                          OpBuilder &componentBuilder,
+                          OpBuilder &wiresBuilder) {
+  // Derive wiresOp from wiresBuilder insertion block.
+  auto *wiresParent = wiresBuilder.getInsertionBlock()->getParentOp();
+  auto wiresOp = dyn_cast<calyx::WiresOp>(wiresParent);
+  assert(wiresOp && "wiresBuilder must point inside a calyx.wires body");
 
   Value addrPort = memOp.addrPort(0);
   Value indexValue = storeOp.getIndices()[0];
-
-  // Simplified approach: just assign index value directly to address port
-  // The conversion framework will handle type conversion later in the pipeline
-  rewriter.create<calyx::AssignOp>(loc, addrPort, indexValue);
-  rewriter.create<calyx::AssignOp>(loc, memOp.writeData(),
-                                   storeOp.getValueToStore());
-
-  // Create constant 1 for contentEn
-  auto constantOp = rewriter.create<hw::ConstantOp>(
-      loc, rewriter.getIntegerAttr(rewriter.getI1Type(), 1));
-  rewriter.create<calyx::AssignOp>(loc, memOp.contentEn(),
-                                   constantOp.getResult());
-
+  Value convertedIndexValue = convertValueForToMatchType(
+      addrPort, indexValue,
+      dyn_cast<calyx::WiresOp>(wiresBuilder.getInsertionBlock()->getParentOp()),
+      wiresBuilder, getOpUniqueName(storeOp), loc, rewriter);
+  wiresBuilder.create<calyx::AssignOp>(loc, addrPort, convertedIndexValue);
+  wiresBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
+                                       storeOp.getValueToStore());
+  auto constantOp = getOrCreateConstant(wiresOp, 1, 1);
+  wiresBuilder.create<calyx::AssignOp>(loc, memOp.writeEn(), constantOp);
   rewriter.eraseOp(storeOp);
 }
 
 static void loadLowering(mlir::ConversionPatternRewriter &rewriter,
                          mlir::memref::LoadOp &loadOp,
                          circt::calyx::SeqMemoryOp &memOp,
-                         const mlir::TypeConverter *typeConverter,
-                         const mlir::Location &loc,
-                         const circt::calyx::WiresOp &wiresOp,
-                         mlir::func::FuncOp &op) {
-  // Use only the ConversionPatternRewriter to avoid insertion point conflicts
-  rewriter.setInsertionPointAfter(loadOp);
+                         const mlir::Location &loc, OpBuilder &componentBuilder,
+                         OpBuilder &wiresBuilder) {
+  auto *wiresParent = wiresBuilder.getInsertionBlock()->getParentOp();
+  auto wiresOp = dyn_cast<calyx::WiresOp>(wiresParent);
+  assert(wiresOp && "wiresBuilder must point inside a calyx.wires body");
 
   Value addrPort = memOp.addrPort(0);
   Value indexValue = loadOp.getIndices()[0];
-
-  // Simplified approach: just assign index value directly to address port
-  // The conversion framework will handle type conversion later in the pipeline
-  rewriter.create<calyx::AssignOp>(loc, addrPort, indexValue);
-
-  // Create constant 1 for contentEn
-  auto constantOp = rewriter.create<hw::ConstantOp>(
-      loc, rewriter.getIntegerAttr(rewriter.getI1Type(), 1));
-  rewriter.create<calyx::AssignOp>(loc, memOp.contentEn(),
-                                   constantOp.getResult());
-
+  Value convertedIndexValue = convertValueForToMatchType(
+      addrPort, indexValue,
+      dyn_cast<calyx::WiresOp>(wiresBuilder.getInsertionBlock()->getParentOp()),
+      wiresBuilder, getOpUniqueName(loadOp), loc, rewriter);
+  wiresBuilder.create<calyx::AssignOp>(loc, addrPort, convertedIndexValue);
+  auto constantOp = getOrCreateConstant(wiresOp, 1, 1);
+  wiresBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(), constantOp);
   rewriter.replaceOp(loadOp, memOp.readData());
 }
 
@@ -103,98 +95,24 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
   SmallVector<Type> outputTypes;
   SmallVector<std::pair<size_t, MemRefType>> memrefArgs; // argIndex, memrefType
 
-  // SIMPLE SCAFFOLDING: Create scaffolding directly without complex logic
-  // Simply create wires and control ops if they don't exist
-  calyx::WiresOp wiresOp;
-  calyx::ControlOp controlOp;
+  // Collect memref uses for deferred lowering after component creation
+  SmallVector<SmallVector<Operation *>> memrefUses; // parallels memrefArgs
 
-  auto wiresOps = op.getFunctionBody().getOps<calyx::WiresOp>();
-  if (wiresOps.empty()) {
-    // Create basic scaffolding without complex block manipulation
-    rewriter.setInsertionPointToStart(&op.getBody().front());
-    wiresOp = rewriter.create<calyx::WiresOp>(loc);
-    controlOp = rewriter.create<calyx::ControlOp>(loc);
-
-    // Move all original operations to the control block
-    Block *controlBlock = &controlOp.getBodyRegion().front();
-    SmallVector<Operation *> opsToMove;
-    for (auto &op : op.getBody().front()) {
-      if (!isa<calyx::WiresOp, calyx::ControlOp>(op)) {
-        opsToMove.push_back(&op);
-      }
-    }
-
-    for (auto *opToMove : opsToMove) {
-      opToMove->moveBefore(controlBlock, controlBlock->end());
-    }
-  } else {
-    wiresOp = *wiresOps.begin();
-    auto controlOps = op.getFunctionBody().getOps<calyx::ControlOp>();
-    if (controlOps.empty()) {
-      return rewriter.notifyMatchFailure(
-          op, "Function has wires but no control operation");
-    }
-    controlOp = *controlOps.begin();
-  }
-
-  // Create builder for memory operations in wires section
-  OpBuilder componentBuilder(rewriter.getContext());
-  componentBuilder.setInsertionPoint(wiresOp);
-
-  // Process input types using TypeConverter - simplified
+  // First pass: classify args, record memref uses only (do not lower yet)
   for (size_t i = 0; i < funcType.getInputs().size(); ++i) {
     Type inputType = funcType.getInputs()[i];
     if (auto memrefType = dyn_cast<MemRefType>(inputType)) {
       // memref arguments become internal memory - skip in component signature
       memrefArgs.push_back({i, memrefType});
+      memrefUses.emplace_back();
 
       if (!memrefType.hasStaticShape()) {
         return rewriter.notifyMatchFailure(
             op, "Dynamic memref shapes not supported");
       }
 
-      // Calculate memory parameters
-      auto shape = memrefType.getShape();
-      int64_t elementWidth = memrefType.getElementTypeBitWidth();
-
-      // Calculate sizes and address widths for each dimension
-      SmallVector<int64_t> sizes, addrSizes;
-      for (auto dim : shape) {
-        sizes.push_back(dim);
-        addrSizes.push_back(llvm::Log2_64_Ceil(dim));
-      }
-
-      // Create memory name
-      std::string memName = "mem_arg_" + std::to_string(i);
-
-      // Create the memory operation with proper sizes and address widths
-      auto memOp = componentBuilder.create<calyx::SeqMemoryOp>(
-          loc, memName, elementWidth, sizes, addrSizes);
-
-      if (op.getArgument(i).getNumUses() == 1) {
-        auto use = op.getArgument(i).getUses().begin();
-        if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(use->getOwner())) {
-          loadLowering(rewriter, loadOp, memOp, typeConverter, loc, wiresOp,
-                       op);
-        } else if (auto storeOp =
-                       dyn_cast<mlir::memref::StoreOp>(use->getOwner())) {
-          storeLowering(rewriter, storeOp, memOp, typeConverter, loc, wiresOp,
-                        op);
-        }
-      } else {
-        for (auto &use : op.getArgument(i).getUses()) {
-          if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(use.getOwner())) {
-            loadLowering(rewriter, loadOp, memOp, typeConverter, loc, wiresOp,
-                         op);
-
-          } else if (auto storeOp =
-                         dyn_cast<mlir::memref::StoreOp>(use.getOwner())) {
-            storeLowering(rewriter, storeOp, memOp, typeConverter, loc, wiresOp,
-                          op);
-          }
-        }
-      }
-      op.getArgument(i).dropAllUses();
+      for (auto &use : op.getArgument(i).getUses())
+        memrefUses.back().push_back(use.getOwner());
     } else {
       // Use TypeConverter for other types
       Type convertedType = typeConverter->convertType(inputType);
@@ -274,21 +192,39 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
     }
   }
 
-  // SECOND: Now setup component structure and move operations
-  // Get the component's wires block to place operations
-  componentOp.getWiresOp().erase();
-  componentOp.getControlOp().erase();
-
-  Block *compBlock = componentOp.getBodyBlock();
-
-  // Use rewriter to move operations from function block to component wires
-  // block This preserves the operations for other patterns to convert them
-  rewriter.setInsertionPointToEnd(compBlock);
-
-  // Move operations one by one using the rewriter
-  for (auto &opToMove :
-       llvm::make_early_inc_range(funcBlock->getOperations())) {
+  // Move remaining ops (loads/stores/return) into component for later passes
+  Block *compBlock = componentOp.getControlOp().getBodyBlock();
+  for (auto &opToMove : llvm::make_early_inc_range(funcBlock->getOperations()))
     opToMove.moveBefore(compBlock, compBlock->end());
+
+  // Create builder for memory operations in wires section
+  auto wiresOp = componentOp.getWiresOp();
+  OpBuilder componentBuilder(rewriter.getContext());
+  componentBuilder.setInsertionPoint(wiresOp);
+  OpBuilder wiresBuilder(wiresOp.getBodyBlock(), wiresOp.getBodyBlock()->end());
+
+  for (size_t idx = 0; idx < memrefArgs.size(); ++idx) {
+    auto [argIndex, memrefType] = memrefArgs[idx];
+    auto shape = memrefType.getShape();
+    int64_t elementWidth = memrefType.getElementTypeBitWidth();
+    SmallVector<int64_t> sizes, addrSizes;
+    for (auto dim : shape) {
+      sizes.push_back(dim);
+      addrSizes.push_back(llvm::Log2_64_Ceil(dim));
+    }
+    std::string memName = "mem_arg_" + std::to_string(argIndex);
+    auto memOp = componentBuilder.create<calyx::SeqMemoryOp>(
+        loc, memName, elementWidth, sizes, addrSizes);
+    // Prepare builders: componentBuilder already set before wiresOp; create a
+    // dedicated wiresBuilder pointing at end of wires body.
+    for (Operation *useOp : memrefUses[idx]) {
+      if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(useOp))
+        loadLowering(rewriter, loadOp, memOp, loc, componentBuilder,
+                     wiresBuilder);
+      else if (auto storeOp = dyn_cast<mlir::memref::StoreOp>(useOp))
+        storeLowering(rewriter, storeOp, memOp, loc, componentBuilder,
+                      wiresBuilder);
+    }
   }
 
   rewriter.eraseOp(op);

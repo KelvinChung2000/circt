@@ -20,6 +20,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
 #include "convertPattern.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -110,29 +111,35 @@ void LowerToCalyxPass::runOnOperation() {
     return; // Nothing to process
   }
 
+  // Step 0: Normalize index types first so subsequent signature + control flow
+  // conversion don't have to materialize i32<->index back-edges.
+  if (failed(applyIndexConversionPatterns(moduleOp))) {
+    signalPassFailure();
+    return;
+  }
+
   // Step 1: Convert function signatures to components with integrated
-  // scaffolding This now includes scaffolding creation inline if not already
-  // present
+  // scaffolding. (Memrefs removed, indices already lowered to i32.)
   if (failed(applyFuncSignatureConversion(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 1a: Apply SCF (Structured Control Flow) conversion patterns
+  // Step 2: Apply SCF (Structured Control Flow) conversion patterns
   if (failed(applyControlFlowConversion(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 2: Convert memref operations BEFORE arithmetic (to establish proper
-  // value dependencies)
-  if (failed(applyMemoryPatterns(moduleOp))) {
+  // Step 3: Convert arith operations (indices already converted)
+  if (failed(applyArithPatterns(moduleOp))) {
     signalPassFailure();
     return;
   }
 
-  // Step 3: Convert arith operations to equivalent std ops (patterns)
-  if (failed(applyArithPatterns(moduleOp))) {
+  // Step 3: Convert memref operations AFTER arithmetic (so index values are
+  // converted)
+  if (failed(applyMemoryPatterns(moduleOp))) {
     signalPassFailure();
     return;
   }
@@ -162,24 +169,75 @@ LogicalResult LowerToCalyxPass::applyControlFlowConversion(ModuleOp moduleOp) {
   // Allow memref operations during SCF conversion - they'll be converted later
   target.addLegalDialect<mlir::memref::MemRefDialect>();
 
-  // Mark SCF operations as illegal to trigger conversion
+  // Mark SCF and Affine operations as illegal to trigger conversion
   target.addIllegalOp<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp>();
+  target.addIllegalOp<mlir::affine::AffineForOp>();
 
   RewritePatternSet patterns(&getContext());
 
-  // Set up type converter
+  // Set up type converter with proper index type conversion and materialization
   TypeConverter typeConverter;
-  typeConverter.addConversion([](Type type) -> Type { return type; });
 
-  // Add SCF to Calyx conversion patterns
+  // Convert index types to i32, pass other types through
+  typeConverter.addConversion([](Type type) -> Type {
+    if (type.isIndex()) {
+      return IntegerType::get(type.getContext(), 32);
+    }
+    return type;
+  });
+
+  // Add source materialization (when converting from original to target type)
+  typeConverter.addSourceMaterialization([](OpBuilder &builder, Type resultType,
+                                            ValueRange inputs,
+                                            Location loc) -> Value {
+    if (inputs.size() != 1) {
+      return nullptr;
+    }
+    Value input = inputs[0];
+
+    // Handle index to i32 conversion
+    if (input.getType().isIndex() && isa<IntegerType>(resultType)) {
+      auto intType = cast<IntegerType>(resultType);
+      if (intType.getWidth() == 32) {
+        return builder.create<arith::IndexCastOp>(loc, resultType, input)
+            .getResult();
+      }
+    }
+
+    return nullptr;
+  });
+
+  // Add target materialization (when converting from target to original type)
+  typeConverter.addTargetMaterialization([](OpBuilder &builder, Type resultType,
+                                            ValueRange inputs,
+                                            Location loc) -> Value {
+    if (inputs.size() != 1) {
+      return nullptr;
+    }
+    Value input = inputs[0];
+
+    // Handle i32 to index conversion
+    if (resultType.isIndex() && isa<IntegerType>(input.getType())) {
+      auto intType = cast<IntegerType>(input.getType());
+      if (intType.getWidth() == 32) {
+        return builder.create<arith::IndexCastOp>(loc, resultType, input)
+            .getResult();
+      }
+    }
+
+    return nullptr;
+  });
+
+  // Add SCF and Affine to Calyx conversion patterns
   patterns.add<lowertocalyx::ScfIfToCalyxPattern>(typeConverter, &getContext());
+  patterns.add<lowertocalyx::ScfForToCalyxPattern>(typeConverter,
+                                                   &getContext());
 
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 
 LogicalResult LowerToCalyxPass::convertBlocksToGroups(ModuleOp moduleOp) {
   // Get the first calyx::ComponentOp in the module
-
   calyx::ComponentOp componentOp =
       *(moduleOp.getOps<calyx::ComponentOp>().begin());
   auto wiresOp = componentOp.getWiresOp();
@@ -196,70 +254,122 @@ LogicalResult LowerToCalyxPass::convertBlocksToGroups(ModuleOp moduleOp) {
     }
   });
 
-  // Process each block - including blocks within calyx.if operations
+  // Process each block using basic block walk with operation grouping
   for (Block *block : blocksToProcess) {
-    // Process ALL blocks, including those within calyx.if operations
-    // The block-to-groups phase is responsible for creating all groups
-
-    // Collect non-control operations that should be moved to groups
-    SmallVector<Operation *> opsToMove;
-    SmallVector<Operation *> groupDoneOps;
     if (block->empty()) {
       continue; // Skip empty blocks
     }
 
-    bool haveDoneOp = false;
-    std::string groupName = "bb" + std::to_string(groupCounter++);
-    auto groupOp =
-        wiresBuilder.create<calyx::GroupOp>(componentOp.getLoc(), groupName);
+    // Construct list of operation groups during block walk
+    SmallVector<SmallVector<Operation *>> operationGroups;
+    SmallVector<Operation *> currentGroup;
 
-    Block *groupBodyBlock = groupOp.getBodyBlock();
-    for (auto &op : llvm::make_early_inc_range(*block)) {
+    // Walk through operations in the block to collect groups
+    for (auto &op : *block) {
       if (op.hasTrait<calyx::ControlLike>()) {
+        // Encountered a control operation - this splits the block
+        if (!currentGroup.empty()) {
+          operationGroups.push_back(std::move(currentGroup));
+          currentGroup.clear();
+        }
+        // Control operations are not moved to groups - they stay in control
         continue;
       }
-      op.moveBefore(groupBodyBlock, groupBodyBlock->end());
-      if (isa<calyx::GroupDoneOp>(op)) {
-        haveDoneOp = true;
-      }
+      // Add non-control operation to current group
+      currentGroup.push_back(&op);
     }
-    if (!haveDoneOp) {
-      // Instead of creating a constant done signal, look for the last done
-      // signal in the group
-      Value lastDoneSignal = nullptr;
 
-      // Iterate through the operations in the group to find done signals
-      for (auto &op : groupBodyBlock->getOperations()) {
-        // Skip the GroupDoneOp itself
-        if (isa<calyx::GroupDoneOp>(op)) {
-          continue;
+    // Add the last group if it contains operations
+    if (!currentGroup.empty()) {
+      operationGroups.push_back(std::move(currentGroup));
+    }
+
+    // Now replace operation groups with enable operations
+    // We need to process this carefully to maintain insertion order
+    SmallVector<Operation *> operationsToRemove;
+    OpBuilder blockBuilder(block, block->begin());
+
+    for (auto &opGroup : operationGroups) {
+      if (opGroup.empty()) {
+        continue;
+      }
+
+      // Create the group
+      std::string groupName = "bb" + std::to_string(groupCounter++);
+      auto groupOp =
+          wiresBuilder.create<calyx::GroupOp>(componentOp.getLoc(), groupName);
+      Block *groupBodyBlock = groupOp.getBodyBlock();
+
+      bool haveDoneOp = false;
+
+      // Find the position of the first operation in this group to place the
+      // enable
+      Operation *firstOpInGroup = opGroup[0];
+      blockBuilder.setInsertionPoint(firstOpInGroup);
+
+      // Create enable operation at the position of the first operation in the
+      // group
+      blockBuilder.create<calyx::EnableOp>(componentOp.getLoc(),
+                                           groupOp.getSymName());
+
+      // Move all operations in this group to the group body
+      for (Operation *op : opGroup) {
+        operationsToRemove.push_back(op);
+        op->moveBefore(groupBodyBlock, groupBodyBlock->end());
+        if (isa<calyx::GroupDoneOp>(*op)) {
+          haveDoneOp = true;
         }
-        // Look for operations that produce done signals
-        if (auto assign = dyn_cast<calyx::AssignOp>(&op)) {
-          lastDoneSignal =
-              resolveDoneSignalForValue(assign.getDest(), componentOp);
-        } else {
-          for (Value result : op.getResults()) {
-            lastDoneSignal = resolveDoneSignalForValue(result, componentOp);
+      }
+
+      // Handle done signal for the group
+      if (!haveDoneOp) {
+        // Look for the last done signal in the group
+        Value lastDoneSignal = nullptr;
+
+        // Collect all unique done signals, then use the last one
+        llvm::SmallPtrSet<Value, 4> uniqueDoneSignals;
+
+        // Iterate through the operations in the group to find done signals
+        for (auto &groupBodyOp : groupBodyBlock->getOperations()) {
+          // Skip the GroupDoneOp itself
+          if (isa<calyx::GroupDoneOp>(groupBodyOp)) {
+            continue;
+          }
+          // Look for operations that produce done signals
+          if (auto assign = dyn_cast<calyx::AssignOp>(&groupBodyOp)) {
+            Value doneSignal =
+                resolveDoneSignalForValue(assign.getDest(), componentOp);
+            if (doneSignal) {
+              uniqueDoneSignals.insert(doneSignal);
+              lastDoneSignal = doneSignal; // Keep updating to get the last one
+            }
+          } else {
+            for (Value result : groupBodyOp.getResults()) {
+              Value doneSignal = resolveDoneSignalForValue(result, componentOp);
+              if (doneSignal) {
+                uniqueDoneSignals.insert(doneSignal);
+                lastDoneSignal =
+                    doneSignal; // Keep updating to get the last one
+              }
+            }
           }
         }
-      }
 
-      if (lastDoneSignal) {
-        // Use the last found done signal for the group done
-        OpBuilder groupBuilder(groupBodyBlock, groupBodyBlock->end());
-        groupBuilder.create<calyx::GroupDoneOp>(componentOp.getLoc(),
-                                                lastDoneSignal);
-      } else {
-        // No done signals found - mark this group as combinational
-        // In Calyx, combinational groups don't have done signals
-        // We can set the "comb" attribute on the group
-        groupOp->setAttr("comb", mlir::UnitAttr::get(componentOp.getContext()));
+        if (lastDoneSignal) {
+          // Use the last found done signal for the group done - create only ONE
+          // GroupDoneOp
+          OpBuilder groupBuilder(groupBodyBlock, groupBodyBlock->end());
+          groupBuilder.create<calyx::GroupDoneOp>(componentOp.getLoc(),
+                                                  lastDoneSignal);
+        } else {
+          // No done signals found - mark this group as combinational
+          // In Calyx, combinational groups don't have done signals
+          // We can set the "comb" attribute on the group
+          groupOp->setAttr("comb",
+                           mlir::UnitAttr::get(componentOp.getContext()));
+        }
       }
     }
-    OpBuilder blockBuilder(block, block->begin());
-    blockBuilder.create<calyx::EnableOp>(componentOp.getLoc(),
-                                         groupOp.getSymName());
   }
 
   return success();
@@ -272,10 +382,51 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
   target.addIllegalDialect<arith::ArithDialect>();
   RewritePatternSet patterns(&getContext());
 
-  // Set up type converter
+  // Set up type converter with proper index type conversion
   TypeConverter typeConverter;
-  typeConverter.addConversion([](Type type) { return type; });
 
+  // Convert index types to i32, pass other types through
+  typeConverter.addConversion([](Type type) -> Type {
+    if (isa<IndexType>(type)) {
+      return IntegerType::get(type.getContext(), 32);
+    }
+    return type;
+  });
+
+  // Mirror the source/target materializations used earlier so that any
+  // intermediate casts introduced (or elided) during IndexCast lowering are
+  // properly legalized instead of leaving an unrealized_conversion_cast.
+  typeConverter.addSourceMaterialization([](OpBuilder &builder, Type resultType,
+                                            ValueRange inputs,
+                                            Location loc) -> Value {
+    if (inputs.size() != 1)
+      return nullptr;
+    Value input = inputs[0];
+    // index -> i32 (source side when original IR had index)
+    if (input.getType().isIndex()) {
+      if (auto intTy = dyn_cast<IntegerType>(resultType);
+          intTy && intTy.getWidth() == 32)
+        return builder.create<arith::IndexCastOp>(loc, resultType, input)
+            .getResult();
+    }
+    return nullptr;
+  });
+
+  typeConverter.addTargetMaterialization([](OpBuilder &builder, Type resultType,
+                                            ValueRange inputs,
+                                            Location loc) -> Value {
+    if (inputs.size() != 1)
+      return nullptr;
+    Value input = inputs[0];
+    // i32 -> index (target side when a user still expects index)
+    if (resultType.isIndex()) {
+      if (auto intTy = dyn_cast<IntegerType>(input.getType());
+          intTy && intTy.getWidth() == 32)
+        return builder.create<arith::IndexCastOp>(loc, resultType, input)
+            .getResult();
+    }
+    return nullptr;
+  });
   // Add arithmetic patterns directly
   patterns.add<lowertocalyx::ArithAddIToCalyxPattern,
                lowertocalyx::ArithSubIToCalyxPattern,
@@ -287,9 +438,9 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
                lowertocalyx::ArithTruncIToCalyxPattern,
                lowertocalyx::ArithCmpIToCalyxPattern,
                lowertocalyx::ArithConstantToCalyxPattern,
-               lowertocalyx::ArithSelectToCalyxPattern,
-               lowertocalyx::ArithIndexCastToCalyxPattern>(typeConverter,
-                                                           &getContext());
+               lowertocalyx::ArithIndexCastToCalyxPattern,
+               lowertocalyx::ArithSelectToCalyxPattern>(typeConverter,
+                                                        &getContext());
 
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
@@ -331,9 +482,14 @@ LogicalResult LowerToCalyxPass::applyMemoryPatterns(ModuleOp moduleOp) {
 
   RewritePatternSet patterns(&getContext());
 
-  // Set up type converter
+  // Set up type converter with proper index type conversion
   TypeConverter typeConverter;
-  typeConverter.addConversion([](Type type) { return type; });
+  typeConverter.addConversion([](Type type) -> Type {
+    if (type.isIndex()) {
+      return IntegerType::get(type.getContext(), 32);
+    }
+    return type;
+  });
 
   // Add complete memref conversion patterns
   patterns.add<lowertocalyx::MemrefLoadToCalyxPattern,
