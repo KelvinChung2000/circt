@@ -232,7 +232,6 @@ LogicalResult LowerToCalyxPass::applyControlFlowConversion(ModuleOp moduleOp) {
   patterns.add<lowertocalyx::ScfIfToCalyxPattern>(typeConverter, &getContext());
   patterns.add<lowertocalyx::ScfForToCalyxPattern>(typeConverter,
                                                    &getContext());
-
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 

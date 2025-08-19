@@ -130,81 +130,84 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
         ifOp, "Could not find yield values in scf.if branches");
   }
 
+  // code path some how have problem
   // Check if both branches have no side effects - if so, use MuxLibOp
   // optimization
-  bool thenHasNoSideEffects = hasNoSideEffects(ifOp.getThenRegion());
-  bool elseHasNoSideEffects = hasNoSideEffects(ifOp.getElseRegion());
+  // bool thenHasNoSideEffects = hasNoSideEffects(ifOp.getThenRegion());
+  // bool elseHasNoSideEffects = hasNoSideEffects(ifOp.getElseRegion());
 
-  if (thenHasNoSideEffects && elseHasNoSideEffects) {
-    // Both branches are side-effect-free, use MuxLibOp instead
-    std::string muxName = "mux_" + getOpUniqueName(ifOp);
-    auto resultType = ifResult.getType();
+  // if (thenHasNoSideEffects && elseHasNoSideEffects) {
+  //   // Both branches are side-effect-free, use MuxLibOp instead
+  //   std::string muxName = "mux_" + getOpUniqueName(ifOp);
+  //   auto resultType = ifResult.getType();
 
-    // First, move all operations from both regions out of the scf.if
-    IRMapping thenMapping, elseMapping;
+  //   // First, move all operations from both regions out of the scf.if
+  //   IRMapping thenMapping, elseMapping;
 
-    // Clone operations from then region (excluding yield)
-    Value thenResult = nullptr;
-    if (!ifOp.getThenRegion().empty()) {
-      auto &thenBlock = ifOp.getThenRegion().front();
-      for (auto &op : llvm::make_early_inc_range(thenBlock)) {
-        if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-          if (yieldOp.getNumOperands() > 0) {
-            thenResult = thenMapping.lookupOrDefault(yieldOp.getOperand(0));
-            if (!thenResult)
-              thenResult = yieldOp.getOperand(0);
-          }
-          continue; // Don't clone yield
-        }
-        // Clone the operation before the scf.if
-        auto *clonedOp = rewriter.clone(op, thenMapping);
-        (void)clonedOp; // Mark as used
-      }
-    }
+  //   // Clone operations from then region (excluding yield)
+  //   Value thenResult = nullptr;
+  //   if (!ifOp.getThenRegion().empty()) {
+  //     auto &thenBlock = ifOp.getThenRegion().front();
+  //     for (auto &op : llvm::make_early_inc_range(thenBlock)) {
+  //       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
+  //         if (yieldOp.getNumOperands() > 0) {
+  //           thenResult = thenMapping.lookupOrDefault(yieldOp.getOperand(0));
+  //           if (!thenResult)
+  //             thenResult = yieldOp.getOperand(0);
+  //         }
+  //         continue; // Don't clone yield
+  //       }
+  //       // Clone the operation before the scf.if
+  //       auto *clonedOp = rewriter.clone(op, thenMapping);
+  //       (void)clonedOp; // Mark as used
+  //     }
+  //   }
 
-    // Clone operations from else region (excluding yield)
-    Value elseResult = nullptr;
-    if (!ifOp.getElseRegion().empty()) {
-      auto &elseBlock = ifOp.getElseRegion().front();
-      for (auto &op : llvm::make_early_inc_range(elseBlock)) {
-        if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-          if (yieldOp.getNumOperands() > 0) {
-            elseResult = elseMapping.lookupOrDefault(yieldOp.getOperand(0));
-            if (!elseResult)
-              elseResult = yieldOp.getOperand(0);
-          }
-          continue; // Don't clone yield
-        }
-        // Clone the operation before the scf.if
-        auto *clonedOp = rewriter.clone(op, elseMapping);
-        (void)clonedOp; // Mark as used
-      }
-    }
+  //   // Clone operations from else region (excluding yield)
+  //   Value elseResult = nullptr;
+  //   if (!ifOp.getElseRegion().empty()) {
+  //     auto &elseBlock = ifOp.getElseRegion().front();
+  //     for (auto &op : llvm::make_early_inc_range(elseBlock)) {
+  //       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
+  //         if (yieldOp.getNumOperands() > 0) {
+  //           elseResult = elseMapping.lookupOrDefault(yieldOp.getOperand(0));
+  //           if (!elseResult)
+  //             elseResult = yieldOp.getOperand(0);
+  //         }
+  //         continue; // Don't clone yield
+  //       }
+  //       // Clone the operation before the scf.if
+  //       auto *clonedOp = rewriter.clone(op, elseMapping);
+  //       (void)clonedOp; // Mark as used
+  //     }
+  //   }
 
-    // Create MuxLibOp at component level
-    rewriter.setInsertionPoint(wiresOp);
-    auto muxOp = rewriter.create<calyx::MuxLibOp>(
-        ifOp.getLoc(), muxName,
-        llvm::SmallVector<mlir::Type>{condition.getType(), resultType,
-                                      resultType, resultType});
+  //   // Create MuxLibOp at component level
+  //   rewriter.setInsertionPoint(wiresOp);
+  //   auto muxOp = rewriter.create<calyx::MuxLibOp>(
+  //       ifOp.getLoc(), muxName,
+  //       llvm::SmallVector<mlir::Type>{condition.getType(), resultType,
+  //                                     resultType, resultType});
 
-    // Set up the mux connections in wires
-    rewriter.setInsertionPointToEnd(wiresOp.getBodyBlock());
+  //   // Set up the mux connections in wires
+  //   rewriter.setInsertionPointToEnd(wiresOp.getBodyBlock());
 
-    // Connect condition to mux.cond
-    rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getCond(), condition);
+  //   // Connect condition to mux.cond
+  //   rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getCond(),
+  //   condition);
 
-    // Connect then value to mux.tru
-    rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getTru(), thenResult);
+  //   // Connect then value to mux.tru
+  //   rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getTru(),
+  //   thenResult);
 
-    // Connect else value to mux.fal
-    rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getFal(), elseResult);
-
-    // Replace the scf.if operation with the mux output
-    rewriter.replaceOp(ifOp, muxOp.getOut());
-
-    return success();
-  }
+  //   // Connect else value to mux.fal
+  //   rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getFal(),
+  //   elseResult); ifOp.dump();
+  //   // Replace the scf.if operation with the mux output
+  //   rewriter.replaceOp(ifOp, muxOp.getOut());
+  //   llvm::outs() << "Replaced scf.if with mux: " << muxName << "\n";
+  //   return success();
+  // }
 
   // Create constant 1 for write enable using deduplication
   auto constantOne = getOrCreateConstant(componentOp.getOperation(), 1);

@@ -25,12 +25,8 @@ static void storeLowering(mlir::ConversionPatternRewriter &rewriter,
                           mlir::memref::StoreOp &storeOp,
                           circt::calyx::SeqMemoryOp &memOp,
                           const mlir::Location &loc,
-                          OpBuilder &componentBuilder,
+                          circt::calyx::WiresOp &wiresOp,
                           OpBuilder &wiresBuilder) {
-  // Derive wiresOp from wiresBuilder insertion block.
-  auto *wiresParent = wiresBuilder.getInsertionBlock()->getParentOp();
-  auto wiresOp = dyn_cast<calyx::WiresOp>(wiresParent);
-  assert(wiresOp && "wiresBuilder must point inside a calyx.wires body");
 
   Value addrPort = memOp.addrPort(0);
   Value indexValue = storeOp.getIndices()[0];
@@ -49,11 +45,9 @@ static void storeLowering(mlir::ConversionPatternRewriter &rewriter,
 static void loadLowering(mlir::ConversionPatternRewriter &rewriter,
                          mlir::memref::LoadOp &loadOp,
                          circt::calyx::SeqMemoryOp &memOp,
-                         const mlir::Location &loc, OpBuilder &componentBuilder,
+                         const mlir::Location &loc,
+                         circt::calyx::WiresOp &wiresOp,
                          OpBuilder &wiresBuilder) {
-  auto *wiresParent = wiresBuilder.getInsertionBlock()->getParentOp();
-  auto wiresOp = dyn_cast<calyx::WiresOp>(wiresParent);
-  assert(wiresOp && "wiresBuilder must point inside a calyx.wires body");
 
   Value addrPort = memOp.addrPort(0);
   Value indexValue = loadOp.getIndices()[0];
@@ -202,6 +196,7 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
   OpBuilder componentBuilder(rewriter.getContext());
   componentBuilder.setInsertionPoint(wiresOp);
   OpBuilder wiresBuilder(wiresOp.getBodyBlock(), wiresOp.getBodyBlock()->end());
+  OpBuilder inplaceBuilder(rewriter.getContext());
 
   for (size_t idx = 0; idx < memrefArgs.size(); ++idx) {
     auto [argIndex, memrefType] = memrefArgs[idx];
@@ -218,12 +213,13 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
     // Prepare builders: componentBuilder already set before wiresOp; create a
     // dedicated wiresBuilder pointing at end of wires body.
     for (Operation *useOp : memrefUses[idx]) {
-      if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(useOp))
-        loadLowering(rewriter, loadOp, memOp, loc, componentBuilder,
-                     wiresBuilder);
-      else if (auto storeOp = dyn_cast<mlir::memref::StoreOp>(useOp))
-        storeLowering(rewriter, storeOp, memOp, loc, componentBuilder,
-                      wiresBuilder);
+      if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(useOp)) {
+        inplaceBuilder.setInsertionPointAfter(loadOp);
+        loadLowering(rewriter, loadOp, memOp, loc, wiresOp, inplaceBuilder);
+      } else if (auto storeOp = dyn_cast<mlir::memref::StoreOp>(useOp)) {
+        inplaceBuilder.setInsertionPointAfter(storeOp);
+        storeLowering(rewriter, storeOp, memOp, loc, wiresOp, inplaceBuilder);
+      }
     }
   }
 
