@@ -444,6 +444,9 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
                lowertocalyx::ArithCmpIToCalyxPattern,
                lowertocalyx::ArithConstantToCalyxPattern,
                lowertocalyx::ArithIndexCastToCalyxPattern,
+               lowertocalyx::ArithShRUIToCalyxPattern,
+               lowertocalyx::ArithShRSIToCalyxPattern,
+               lowertocalyx::ArithShLIToCalyxPattern,
                lowertocalyx::ArithSelectToCalyxPattern>(typeConverter,
                                                         &getContext());
   moduleOp.dump();

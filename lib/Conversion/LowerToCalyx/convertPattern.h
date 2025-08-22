@@ -54,11 +54,10 @@ struct ArithUnaryOpToCalyxPattern : mlir::OpConversionPattern<SourceType> {
                   mlir::ConversionPatternRewriter &rewriter) const override;
 };
 
-template <typename SourceType, typename TargetType>
-struct ArithComparisonOpToCalyxPattern : mlir::OpConversionPattern<SourceType> {
-  using mlir::OpConversionPattern<SourceType>::OpConversionPattern;
+struct ArithCmpIToCalyxPattern : mlir::OpConversionPattern<arith::CmpIOp> {
+  using mlir::OpConversionPattern<arith::CmpIOp>::OpConversionPattern;
   mlir::LogicalResult
-  matchAndRewrite(SourceType op, typename SourceType::Adaptor adaptor,
+  matchAndRewrite(arith::CmpIOp op, typename arith::CmpIOp::Adaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override;
 };
 
@@ -100,10 +99,13 @@ using ArithOrIToCalyxPattern =
     ArithBinaryOpToCalyxPattern<mlir::arith::OrIOp, calyx::OrLibOp>;
 using ArithXOrIToCalyxPattern =
     ArithBinaryOpToCalyxPattern<mlir::arith::XOrIOp, calyx::XorLibOp>;
+
+using ArithShRUIToCalyxPattern =
+    ArithBinaryOpToCalyxPattern<mlir::arith::ShRUIOp, calyx::RshLibOp>;
 using ArithShRSIToCalyxPattern =
     ArithBinaryOpToCalyxPattern<mlir::arith::ShRSIOp, calyx::SrshLibOp>;
-using ArithShRUIToCalyxPattern =
-    ArithBinaryOpToCalyxPattern<mlir::arith::ShRUIOp, calyx::ShruLibOp>;
+using ArithShLIToCalyxPattern =
+    ArithBinaryOpToCalyxPattern<mlir::arith::ShLIOp, calyx::LshLibOp>;
 
 // Binary floating-point operations
 using ArithAddFToCalyxPattern =
@@ -118,8 +120,6 @@ using ArithTruncIToCalyxPattern =
     ArithUnaryOpToCalyxPattern<mlir::arith::TruncIOp, calyx::SliceLibOp>;
 
 // Comparison operations - TODO: Need proper Calyx comparison operations
-using ArithCmpIToCalyxPattern =
-    ArithComparisonOpToCalyxPattern<mlir::arith::CmpIOp, calyx::EqLibOp>;
 
 // Special operations
 using ArithConstantToCalyxPattern =

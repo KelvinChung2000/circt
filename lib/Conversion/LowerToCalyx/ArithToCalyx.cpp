@@ -36,6 +36,79 @@ using namespace mlir;
 namespace circt {
 namespace lowertocalyx {
 
+// Simple container for comparison lib op ports
+struct ComparisonPorts {
+  Value leftPort;
+  Value rightPort;
+  Value outPort;
+};
+
+// Create the appropriate Calyx comparison library operation based on the
+// arith integer comparison predicate and return its key ports.
+static ComparisonPorts createComparisonLibOp(arith::CmpIPredicate pred,
+                                             OpBuilder &builder, Location loc,
+                                             StringRef symName,
+                                             ArrayRef<Type> resultTypes) {
+  switch (pred) {
+  case arith::CmpIPredicate::eq: {
+    auto op = builder.create<calyx::EqLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+  case arith::CmpIPredicate::ne: {
+    auto op = builder.create<calyx::NeqLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+
+  // Signed integer comparisons
+  case arith::CmpIPredicate::slt: {
+    auto op = builder.create<calyx::SltLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+  case arith::CmpIPredicate::sle: {
+    auto op = builder.create<calyx::SleLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+  case arith::CmpIPredicate::sgt: {
+    auto op = builder.create<calyx::SgtLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+  case arith::CmpIPredicate::sge: {
+    auto op = builder.create<calyx::SgeLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+
+  // Unsigned integer comparisons
+  case arith::CmpIPredicate::ult: {
+    auto op = builder.create<calyx::LtLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+  case arith::CmpIPredicate::ule: {
+    auto op = builder.create<calyx::LeLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+  case arith::CmpIPredicate::ugt: {
+    auto op = builder.create<calyx::GtLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+  case arith::CmpIPredicate::uge: {
+    auto op = builder.create<calyx::GeLibOp>(
+        loc, builder.getStringAttr(symName), resultTypes);
+    return {op.getLeft(), op.getRight(), op.getOut()};
+  }
+  }
+
+  llvm_unreachable("Unhandled arith::CmpIPredicate in createComparisonLibOp");
+}
+
 // Template function implementation for binary operations
 template <typename SourceType, typename TargetType>
 LogicalResult
@@ -52,7 +125,14 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   Value rhs = adaptor.getRhs();
 
   // Get the result type width
-  auto resultType = op.getResult().getType();
+  // Use the TypeConverter to convert result types (e.g., index -> i32)
+  Type resultType = op.getResult().getType();
+  if (auto *tc = this->getTypeConverter())
+    if (Type converted = tc->convertType(resultType))
+      resultType = converted;
+  // Normalize any lingering index types to i32 for width reasoning
+  if (isa<IndexType>(resultType))
+    resultType = IntegerType::get(op.getContext(), 32);
   auto intType = dyn_cast<IntegerType>(resultType);
   if (!intType) {
     return rewriter.notifyMatchFailure(op, "Only integer types supported");
@@ -117,7 +197,14 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   Value rhs = adaptor.getRhs();
 
   // Get the result type width
-  auto resultType = op.getResult().getType();
+  // Use the TypeConverter to convert result types (e.g., index -> i32)
+  Type resultType = op.getResult().getType();
+  if (auto *tc = this->getTypeConverter())
+    if (Type converted = tc->convertType(resultType))
+      resultType = converted;
+  // Normalize any lingering index types to i32 for width reasoning
+  if (isa<IndexType>(resultType))
+    resultType = IntegerType::get(op.getContext(), 32);
   auto intType = dyn_cast<IntegerType>(resultType);
   if (!intType) {
     return rewriter.notifyMatchFailure(op, "Only integer types supported");
@@ -256,19 +343,68 @@ ArithUnaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
 }
 
 // Template function implementation for comparison operations
-template <typename SourceType, typename TargetType>
-LogicalResult
-ArithComparisonOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
-    SourceType op, typename SourceType::Adaptor adaptor,
+LogicalResult ArithCmpIToCalyxPattern::matchAndRewrite(
+    arith::CmpIOp op, typename arith::CmpIOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
-  // Default implementation for comparison operations
-  // TODO: Create equivalent Calyx comparison with adaptor.getLhs(),
-  // adaptor.getRhs(), and op.getPredicate() Example conversion pattern:
-  // 1. Get operation location, operands, and predicate
-  // 2. Create appropriate Calyx comparison operation
-  // 3. Replace the original operation with the Calyx operation
 
-  return failure();
+  // Get operation location and operands
+  auto loc = op.getLoc();
+  Value lhs = adaptor.getLhs();
+  Value rhs = adaptor.getRhs();
+
+  // Get the result type width
+  // Use the TypeConverter to convert result types (e.g., index -> i32)
+  Type resultType = op.getResult().getType();
+  if (auto *tc = this->getTypeConverter())
+    if (Type converted = tc->convertType(resultType))
+      resultType = converted;
+  // Normalize any lingering index types to i32 for width reasoning
+  if (isa<IndexType>(resultType))
+    resultType = IntegerType::get(op.getContext(), 32);
+  auto intType = dyn_cast<IntegerType>(resultType);
+  if (!intType) {
+    return rewriter.notifyMatchFailure(op, "Only integer types supported");
+  }
+
+  // Create a simple symbol name using the general utility function
+  std::string symName = getOpUniqueName(op);
+
+  // Create result types: left input, right input, output (all same width for
+  // binary ops)
+  SmallVector<Type> resultTypes = {resultType, resultType,
+                                   rewriter.getI1Type()};
+
+  // Find the parent component to create library operations at the component
+  // level
+  calyx::ComponentOp topLevelOp =
+      op->template getParentOfType<calyx::ComponentOp>();
+  auto wiresOp = topLevelOp.getWiresOp();
+
+  // Create the library operation inside the wires operation
+  OpBuilder componentBuilder(wiresOp);
+
+  // Create the appropriate Calyx library operation based on the predicate
+  auto ports = createComparisonLibOp(op.getPredicate(), componentBuilder, loc,
+                                     symName, resultTypes);
+
+  // Use the ports from the helper function
+  Value leftPort = ports.leftPort;
+  Value rightPort = ports.rightPort;
+  Value outPort = ports.outPort;
+
+  // Create assign operations in the wires section (not in groups)
+  // Use the same wiresBlock we created the library operation in
+  auto &wiresBlock = wiresOp.getBodyRegion().front();
+  OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
+
+  wiresBuilder.create<calyx::AssignOp>(loc, leftPort, lhs);
+  wiresBuilder.create<calyx::AssignOp>(loc, rightPort, rhs);
+
+  // Replace the original arith operation result with the library operation
+  // output
+  rewriter.replaceOp(op, outPort);
+
+  return success();
 }
 
 // Template function implementation for special operations
@@ -371,12 +507,13 @@ template struct ArithBinaryOpToCalyxPattern<mlir::arith::AndIOp,
 template struct ArithBinaryOpToCalyxPattern<mlir::arith::OrIOp, calyx::OrLibOp>;
 template struct ArithBinaryOpToCalyxPattern<mlir::arith::XOrIOp,
                                             calyx::XorLibOp>;
-// template struct ArithBinaryOpToCalyxPattern<mlir::arith::ShLIOp,
-//                                             calyx::ShruLibOp>;
+
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::ShRUIOp,
+                                            calyx::RshLibOp>;
 template struct ArithBinaryOpToCalyxPattern<mlir::arith::ShRSIOp,
                                             calyx::SrshLibOp>;
-template struct ArithBinaryOpToCalyxPattern<mlir::arith::ShRUIOp,
-                                            calyx::ShruLibOp>;
+template struct ArithBinaryOpToCalyxPattern<mlir::arith::ShLIOp,
+                                            calyx::LshLibOp>;
 
 // Explicit template instantiations for binary floating-point operations
 template struct ArithBinaryOpToCalyxPattern<mlir::arith::AddFOp,
@@ -401,9 +538,9 @@ template struct ArithUnaryOpToCalyxPattern<mlir::arith::TruncIOp,
 // calyx::IndexCastLibOp>; template struct
 // ArithUnaryOpToCalyxPattern<mlir::arith::BitcastOp, calyx::BitcastLibOp>;
 
-// Explicit template instantiations for comparison operations
-template struct ArithComparisonOpToCalyxPattern<mlir::arith::CmpIOp,
-                                                calyx::EqLibOp>;
+// // Explicit template instantiations for comparison operations
+// template struct ArithComparisonOpToCalyxPattern<mlir::arith::CmpIOp,
+//                                                 calyx::EqLibOp>;
 // template struct ArithComparisonOpToCalyxPattern<mlir::arith::CmpFOp,
 // calyx::CompareFOpIEEE754>;
 
