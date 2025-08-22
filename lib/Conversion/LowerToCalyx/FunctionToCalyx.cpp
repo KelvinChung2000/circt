@@ -30,10 +30,9 @@ static void storeLowering(mlir::ConversionPatternRewriter &rewriter,
 
   Value addrPort = memOp.addrPort(0);
   Value indexValue = storeOp.getIndices()[0];
-  Value convertedIndexValue = convertValueForToMatchType(
-      addrPort, indexValue,
-      dyn_cast<calyx::WiresOp>(wiresBuilder.getInsertionBlock()->getParentOp()),
-      wiresBuilder, getOpUniqueName(storeOp), loc, rewriter);
+  Value convertedIndexValue =
+      convertValueForToMatchType(addrPort, indexValue, wiresOp, wiresBuilder,
+                                 getOpUniqueName(storeOp), loc, rewriter);
   wiresBuilder.create<calyx::AssignOp>(loc, addrPort, convertedIndexValue);
   wiresBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
                                        storeOp.getValueToStore());
@@ -51,10 +50,9 @@ static void loadLowering(mlir::ConversionPatternRewriter &rewriter,
 
   Value addrPort = memOp.addrPort(0);
   Value indexValue = loadOp.getIndices()[0];
-  Value convertedIndexValue = convertValueForToMatchType(
-      addrPort, indexValue,
-      dyn_cast<calyx::WiresOp>(wiresBuilder.getInsertionBlock()->getParentOp()),
-      wiresBuilder, getOpUniqueName(loadOp), loc, rewriter);
+  Value convertedIndexValue =
+      convertValueForToMatchType(addrPort, indexValue, wiresOp, wiresBuilder,
+                                 getOpUniqueName(loadOp), loc, rewriter);
   wiresBuilder.create<calyx::AssignOp>(loc, addrPort, convertedIndexValue);
   auto constantOp = getOrCreateConstant(wiresOp, 1, 1);
   wiresBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(), constantOp);
@@ -212,13 +210,26 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
         loc, memName, elementWidth, sizes, addrSizes);
     // Prepare builders: componentBuilder already set before wiresOp; create a
     // dedicated wiresBuilder pointing at end of wires body.
-    for (Operation *useOp : memrefUses[idx]) {
-      if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(useOp)) {
-        inplaceBuilder.setInsertionPointAfter(loadOp);
-        loadLowering(rewriter, loadOp, memOp, loc, wiresOp, inplaceBuilder);
-      } else if (auto storeOp = dyn_cast<mlir::memref::StoreOp>(useOp)) {
-        inplaceBuilder.setInsertionPointAfter(storeOp);
-        storeLowering(rewriter, storeOp, memOp, loc, wiresOp, inplaceBuilder);
+    if (memrefUses.size() == 1) {
+      if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(memrefUses[idx][0])) {
+        loadLowering(rewriter, loadOp, memOp, loc, wiresOp, wiresBuilder);
+      } else if (auto storeOp =
+                     dyn_cast<mlir::memref::StoreOp>(memrefUses[idx][0])) {
+        storeLowering(rewriter, storeOp, memOp, loc, wiresOp, wiresBuilder);
+      } else {
+        return rewriter.notifyMatchFailure(
+            op, "Unexpected memref use type for argument " +
+                    std::to_string(argIndex));
+      }
+    } else {
+      for (Operation *useOp : memrefUses[idx]) {
+        if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(useOp)) {
+          inplaceBuilder.setInsertionPointAfter(loadOp);
+          loadLowering(rewriter, loadOp, memOp, loc, wiresOp, inplaceBuilder);
+        } else if (auto storeOp = dyn_cast<mlir::memref::StoreOp>(useOp)) {
+          inplaceBuilder.setInsertionPointAfter(storeOp);
+          storeLowering(rewriter, storeOp, memOp, loc, wiresOp, inplaceBuilder);
+        }
       }
     }
   }

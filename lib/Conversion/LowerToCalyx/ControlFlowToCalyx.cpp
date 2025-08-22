@@ -74,7 +74,6 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
 
   // Get the condition and create register for this if operation
   Value condition = ifOp.getCondition();
-  Value ifResult = ifOp.getResult(0);
 
   // Create register at component level - find the component and wires op
   auto componentOp = ifOp->getParentOfType<calyx::ComponentOp>();
@@ -89,46 +88,17 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
   // Set insertion point in the wires op body for register creation
   rewriter.setInsertionPoint(wiresOp);
 
-  std::string regName = "reg_" + getOpUniqueName(ifOp);
-  auto resultReg = rewriter.create<calyx::RegisterOp>(ifOp.getLoc(), regName,
-                                                      ifResult.getType());
+  SmallVector<calyx::RegisterOp> ifResultsRegs;
+  for (size_t i = 0; i < ifOp.getResults().size(); ++i) {
+    std::string regName =
+        std::string("reg_") + getOpUniqueName(ifOp) + "_r_" + std::to_string(i);
+    ifResultsRegs.push_back(rewriter.create<calyx::RegisterOp>(
+        ifOp.getLoc(), regName, ifOp.getResult(i).getType()));
+  }
 
   // Find the yield values in then and else regions
-  Value thenYieldValue = nullptr;
-  Value elseYieldValue = nullptr;
-
-  // Get then yield value
   auto &thenRegion = ifOp.getThenRegion();
-  if (!thenRegion.empty()) {
-    auto &thenBlock = thenRegion.front();
-    for (auto &op : thenBlock) {
-      if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-        if (yieldOp.getNumOperands() > 0) {
-          thenYieldValue = yieldOp.getOperand(0);
-        }
-        break;
-      }
-    }
-  }
-
-  // Get else yield value
   auto &elseRegion = ifOp.getElseRegion();
-  if (!elseRegion.empty()) {
-    auto &elseBlock = elseRegion.front();
-    for (auto &op : elseBlock) {
-      if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-        if (yieldOp.getNumOperands() > 0) {
-          elseYieldValue = yieldOp.getOperand(0);
-        }
-        break;
-      }
-    }
-  }
-
-  if (!thenYieldValue || !elseYieldValue) {
-    return rewriter.notifyMatchFailure(
-        ifOp, "Could not find yield values in scf.if branches");
-  }
 
   // code path some how have problem
   // Check if both branches have no side effects - if so, use MuxLibOp
@@ -220,15 +190,23 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
     auto &thenBlock = thenRegion.front();
     for (auto &op : llvm::make_early_inc_range(thenBlock)) {
       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-        rewriter.setInsertionPoint(&op);
-        // Create assignment: reg.in = thenYieldValue
-        rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
-                                         thenYieldValue, ifOp.getCondition());
-        // Create assignment: reg.write_en = 1
-        rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
-                                         constantOne, ifOp.getCondition());
-        // Create group_done
-        rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
+        // Replace std::enumerate with indexed loop
+        auto operands = yieldOp.getOperands();
+        for (size_t i = 0; i < operands.size(); ++i) {
+          auto yieldValue = operands[i];
+          // Get the corresponding register for this yield value
+          auto &resultReg = ifResultsRegs[i];
+          // Create assignment: reg.in = thenYieldValue
+          rewriter.setInsertionPoint(&op);
+          // Create assignment: reg.in = thenYieldValue
+          rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
+                                           yieldValue, ifOp.getCondition());
+          // Create assignment: reg.write_en = 1
+          rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
+                                           constantOne, ifOp.getCondition());
+          // Create group_done
+          rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
+        }
         rewriter.eraseOp(yieldOp);
       }
     }
@@ -239,26 +217,32 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
     auto &elseBlock = elseRegion.front();
     for (auto &op : llvm::make_early_inc_range(elseBlock)) {
       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-        rewriter.setInsertionPoint(wiresOp);
-        // Create the NotLibOp at function level for now
-        auto conditionType = condition.getType();
-        auto invertedCondition = rewriter.create<calyx::NotLibOp>(
-            ifOp.getLoc(), "inverted_cond_" + getOpUniqueName(ifOp),
-            llvm::SmallVector<mlir::Type>{conditionType, conditionType});
-        rewriter.setInsertionPoint(&op);
-        rewriter.create<calyx::AssignOp>(op.getLoc(), invertedCondition.getIn(),
-                                         ifOp.getCondition());
-        // Create assignment: reg.in = elseYieldValue
-        rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
-                                         elseYieldValue,
-                                         invertedCondition.getOut());
-        // Create assignment: reg.write_en = 1
-        rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
-                                         constantOne,
-                                         invertedCondition.getOut());
-        // Create group_done
-        rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
-        rewriter.eraseOp(yieldOp);
+        auto operands = yieldOp.getOperands();
+        for (size_t i = 0; i < operands.size(); ++i) {
+          auto yieldValue = operands[i];
+          // Get the corresponding register for this yield value
+          auto &resultReg = ifResultsRegs[i];
+          rewriter.setInsertionPoint(wiresOp);
+          // Create the NotLibOp at function level for now
+          auto conditionType = condition.getType();
+          auto invertedCondition = rewriter.create<calyx::NotLibOp>(
+              ifOp.getLoc(), "inverted_cond_" + getOpUniqueName(ifOp),
+              llvm::SmallVector<mlir::Type>{conditionType, conditionType});
+          rewriter.setInsertionPoint(&op);
+          rewriter.create<calyx::AssignOp>(
+              op.getLoc(), invertedCondition.getIn(), ifOp.getCondition());
+          // Create assignment: reg.in = elseYieldValue
+          rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
+                                           yieldValue,
+                                           invertedCondition.getOut());
+          // Create assignment: reg.write_en = 1
+          rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getWriteEn(),
+                                           constantOne,
+                                           invertedCondition.getOut());
+          // Create group_done
+          rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
+          rewriter.eraseOp(yieldOp);
+        }
       }
     }
   }
@@ -286,8 +270,13 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
 
   // Replace the scf.if with the calyx.if, providing the register output as the
   // result
-  rewriter.replaceOp(ifOp, resultReg.getOut());
-
+  for (size_t i = 0; i < ifResultsRegs.size(); ++i) {
+    // Get the register for this result
+    auto &resultReg = ifResultsRegs[i];
+    // Connect the calyx.if result to the register output
+    ifOp.getResult(i).replaceAllUsesWith(resultReg.getOut());
+  }
+  ifOp.erase();
   return success();
 }
 
@@ -318,7 +307,8 @@ LogicalResult ScfForToCalyxPattern::matchAndRewrite(
 
   if (!lbConstant || !ubConstant || !stepConstant) {
     return rewriter.notifyMatchFailure(
-        forOp, "Only constant-bound for loops are supported");
+        forOp, "Only constant-bound for loops are supported, convert the for "
+               "loop to while loop and lower via the while op");
   }
 
   // Extract constant values
@@ -425,23 +415,53 @@ LogicalResult ScfForToCalyxPattern::matchAndRewrite(
     }
   }
 
-  // // Add a single group done signal to the initialization group
-  // Value lastDoneSignal = nullptr;
-  // if (counterReg) {
-  //   auto counterRegOp = counterReg.getDefiningOp<calyx::RegisterOp>();
-  //   if (counterRegOp) {
-  //     lastDoneSignal = counterRegOp.getDone();
-  //   }
-  // } else if (!iterArgRegs.empty()) {
-  //   auto iterArgRegOp = iterArgRegs[0].getDefiningOp<calyx::RegisterOp>();
-  //   if (iterArgRegOp) {
-  //     lastDoneSignal = iterArgRegOp.getDone();
-  //   }
-  // }
+  // Add a single group done signal to the initialization group.
+  // Prefer iteration argument register done signals. If multiple iter args,
+  // AND all of their done signals together. Fallback to counterReg if none.
+  auto buildAndChain = [&](SmallVector<Value> &signals) -> Value {
+    if (signals.empty())
+      return nullptr;
+    if (signals.size() == 1)
+      return signals.front();
+    // Chain AndLibOps pairwise: (((s0 & s1) & s2) & ...)
+    Value accum = signals[0];
+    for (size_t i = 1; i < signals.size(); ++i) {
+      auto loc = forOp.getLoc();
+      // Create AndLibOp at component level before wires.
+      OpBuilder compBuilder(componentOp.getContext());
+      compBuilder.setInsertionPoint(wiresOp);
+      SmallVector<Type> andTypes = {rewriter.getI1Type(), rewriter.getI1Type(),
+                                    rewriter.getI1Type()};
+      auto andOp = compBuilder.create<calyx::AndLibOp>(
+          loc,
+          rewriter.getStringAttr("for_iter_args_and_" + getOpUniqueName(forOp) +
+                                 "_" + std::to_string(i)),
+          andTypes);
+      // Connect assigns in wires region end.
+      auto &wiresBlockRef = wiresOp.getBodyRegion().front();
+      OpBuilder wiresAssignBuilder(&wiresBlockRef, wiresBlockRef.end());
+      wiresAssignBuilder.create<calyx::AssignOp>(loc, andOp.getLeft(), accum);
+      wiresAssignBuilder.create<calyx::AssignOp>(loc, andOp.getRight(),
+                                                 signals[i]);
+      accum = andOp.getOut();
+    }
+    return accum;
+  };
 
-  // if (lastDoneSignal) {
-  //   rewriter.create<calyx::GroupDoneOp>(forOp.getLoc(), lastDoneSignal);
-  // }
+  Value initDoneSignal = nullptr;
+  if (!iterArgRegs.empty()) {
+    SmallVector<Value> iterDoneSignals;
+    for (auto v : iterArgRegs) {
+      if (auto regOp = v.getDefiningOp<calyx::RegisterOp>())
+        iterDoneSignals.push_back(regOp.getDone());
+    }
+    initDoneSignal = buildAndChain(iterDoneSignals);
+  } else if (counterReg) {
+    if (auto counterRegOp = counterReg.getDefiningOp<calyx::RegisterOp>())
+      initDoneSignal = counterRegOp.getDone();
+  }
+  if (initDoneSignal)
+    rewriter.create<calyx::GroupDoneOp>(forOp.getLoc(), initDoneSignal);
 
   // Create the calyx.repeat operation
   auto calyxRepeatOp = rewriter.create<calyx::RepeatOp>(
@@ -467,19 +487,36 @@ LogicalResult ScfForToCalyxPattern::matchAndRewrite(
 
     // STEP 2: Extract yield values before moving operations
     llvm::SmallVector<Value> yieldValues;
+    mlir::scf::YieldOp yieldOpFound = nullptr;
     for (auto &op : forBlock) {
       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
+        yieldOpFound = yieldOp;
         for (unsigned i = 0; i < yieldOp.getNumOperands(); ++i) {
           yieldValues.push_back(yieldOp.getOperand(i));
         }
-        break;
+        break; // Only one yield expected
       }
     }
 
     // STEP 3: Move all operations except the yield
     for (auto &op : llvm::make_early_inc_range(forBlock)) {
       if (isa<mlir::scf::YieldOp>(op)) {
-        rewriter.eraseOp(&op); // Remove yield as Calyx repeat doesn't need it
+        // Replace the yield with a GroupDoneOp similar to ifOp lowering.
+        // Prefer the counter register done signal, else first iter arg reg.
+        // Prefer iter arg done signals. If multiple, AND them. Fallback to
+        // counterReg.
+        Value doneSignal;
+        if (!iterArgRegs.empty()) {
+          SmallVector<Value> iterDoneSignals;
+          for (auto v : iterArgRegs)
+            if (auto regOp = v.getDefiningOp<calyx::RegisterOp>())
+              iterDoneSignals.push_back(regOp.getDone());
+          doneSignal = buildAndChain(iterDoneSignals);
+        }
+
+        if (doneSignal)
+          rewriter.create<calyx::GroupDoneOp>(op.getLoc(), doneSignal);
+        rewriter.eraseOp(&op); // Remove yield; Calyx repeat uses done signal
         continue;
       }
       op.moveBefore(&repeatBlock, repeatBlock.end());

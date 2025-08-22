@@ -402,11 +402,13 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
       return nullptr;
     Value input = inputs[0];
     // index -> i32 (source side when original IR had index)
-    if (input.getType().isIndex()) {
-      if (auto intTy = dyn_cast<IntegerType>(resultType);
-          intTy && intTy.getWidth() == 32)
+    // Handle index to i32 conversion
+    if (input.getType().isIndex() && isa<IntegerType>(resultType)) {
+      auto intType = cast<IntegerType>(resultType);
+      if (intType.getWidth() == 32) {
         return builder.create<arith::IndexCastOp>(loc, resultType, input)
             .getResult();
+      }
     }
     return nullptr;
   });
@@ -414,16 +416,20 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
   typeConverter.addTargetMaterialization([](OpBuilder &builder, Type resultType,
                                             ValueRange inputs,
                                             Location loc) -> Value {
-    if (inputs.size() != 1)
+    if (inputs.size() != 1) {
       return nullptr;
+    }
     Value input = inputs[0];
-    // i32 -> index (target side when a user still expects index)
-    if (resultType.isIndex()) {
-      if (auto intTy = dyn_cast<IntegerType>(input.getType());
-          intTy && intTy.getWidth() == 32)
+
+    // Handle i32 to index conversion
+    if (resultType.isIndex() && isa<IntegerType>(input.getType())) {
+      auto intType = cast<IntegerType>(input.getType());
+      if (intType.getWidth() == 32) {
         return builder.create<arith::IndexCastOp>(loc, resultType, input)
             .getResult();
+      }
     }
+
     return nullptr;
   });
   // Add arithmetic patterns directly
@@ -440,7 +446,7 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
                lowertocalyx::ArithIndexCastToCalyxPattern,
                lowertocalyx::ArithSelectToCalyxPattern>(typeConverter,
                                                         &getContext());
-
+  moduleOp.dump();
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 
