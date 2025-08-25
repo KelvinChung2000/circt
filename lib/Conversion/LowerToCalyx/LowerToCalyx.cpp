@@ -30,6 +30,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Casting.h"
 #include <cassert>
 
@@ -52,10 +53,11 @@ namespace lowertocalyx {
 
 namespace {
 
-// Helper to materialize casts between index and integer types in a
-// DataLayout-aware way. Handles:
-//   - index -> iN: index_cast to i[idxWidth], then ext/trunc to iN
-//   - iN -> index: ext/trunc to i[idxWidth], then index_cast to index
+// Helper to materialize casts between index and integer types, always
+// canonicalizing index width to i32 in this pass, and never producing
+// IndexType as a result. Handles:
+//   - index -> iN: index_cast to i32, then ext/trunc to iN
+//   - iN -> index: NOT supported (we avoid re-introducing index types)
 static Value materializeIndexIntegerCast(OpBuilder &builder, Type resultType,
                                          ValueRange inputs, Location loc) {
   if (inputs.size() != 1)
@@ -64,15 +66,14 @@ static Value materializeIndexIntegerCast(OpBuilder &builder, Type resultType,
   Value input = inputs[0];
   MLIRContext *ctx = builder.getContext();
 
-  // Choose a conservative default for index bitwidth.
-  // If needed, this can be enhanced to query DataLayout when available.
-  unsigned idxWidth = 64;
+  // All index materializations in this pass bridge through i32.
+  unsigned idxWidth = 32;
   auto iIdxTy = IntegerType::get(ctx, idxWidth);
 
   // index -> integer
   if (llvm::isa<IndexType>(input.getType())) {
     if (auto resIntTy = llvm::dyn_cast<IntegerType>(resultType)) {
-      // First cast index to the data-layout-sized integer.
+      // First cast index to i32.
       Value asIIdx =
           builder.create<arith::IndexCastOp>(loc, iIdxTy, input).getResult();
       unsigned tgtWidth = resIntTy.getWidth();
@@ -87,23 +88,8 @@ static Value materializeIndexIntegerCast(OpBuilder &builder, Type resultType,
     return nullptr;
   }
 
-  // integer -> index
-  if (auto inIntTy = llvm::dyn_cast<IntegerType>(input.getType())) {
-    if (llvm::isa<IndexType>(resultType)) {
-      Value widthAdjusted = input;
-      unsigned inWidth = inIntTy.getWidth();
-      if (inWidth != idxWidth) {
-        if (inWidth < idxWidth)
-          widthAdjusted =
-              builder.create<arith::ExtUIOp>(loc, iIdxTy, input).getResult();
-        else
-          widthAdjusted =
-              builder.create<arith::TruncIOp>(loc, iIdxTy, input).getResult();
-      }
-      return builder.create<arith::IndexCastOp>(loc, resultType, widthAdjusted)
-          .getResult();
-    }
-  }
+  // integer -> index is intentionally unsupported to avoid reintroducing
+  // index-typed values. Return nullptr to signal no materialization.
 
   return nullptr;
 }
@@ -154,6 +140,11 @@ private:
 
   /// Helper to check if a function should be processed
   bool shouldProcessFunction(mlir::func::FuncOp funcOp);
+
+  /// Extra step: Deduplicate repeated assignments inside each group where
+  /// both destination and source are identical. Keeps the first occurrence,
+  /// removes subsequent duplicates.
+  LogicalResult dedupGroupAssignments(ModuleOp moduleOp);
 };
 
 //===----------------------------------------------------------------------===//
@@ -210,6 +201,12 @@ void LowerToCalyxPass::runOnOperation() {
   }
 
   if (failed(convertBlocksToGroups(moduleOp))) {
+    signalPassFailure();
+    return;
+  }
+
+  // Extra step: remove duplicate calyx.assign within each group
+  if (failed(dedupGroupAssignments(moduleOp))) {
     signalPassFailure();
     return;
   }
@@ -402,6 +399,51 @@ LogicalResult LowerToCalyxPass::convertBlocksToGroups(ModuleOp moduleOp) {
     }
   }
 
+  return success();
+}
+
+LogicalResult LowerToCalyxPass::dedupGroupAssignments(ModuleOp moduleOp) {
+  // Walk all components in the module (usually one, but support many)
+  for (auto componentOp : moduleOp.getOps<calyx::ComponentOp>()) {
+    auto wiresOp = componentOp.getWiresOp();
+    if (!wiresOp)
+      continue;
+
+    // For each group under wires, remove duplicate assigns with same dest/src
+    for (auto groupOp : wiresOp.getOps<calyx::GroupOp>()) {
+      Block *groupBlock = groupOp.getBodyBlock();
+      if (!groupBlock)
+        continue;
+
+      // Track seen (dest -> set of src) pairs.
+      llvm::DenseMap<Value, llvm::DenseSet<Value>> seen;
+      SmallVector<Operation *> toErase;
+
+      for (Operation &op :
+           llvm::make_early_inc_range(groupBlock->getOperations())) {
+        auto assign = dyn_cast<calyx::AssignOp>(&op);
+        if (!assign)
+          continue;
+
+        Value dest = assign.getDest();
+        Value src = assign.getSrc();
+
+        // If we've already assigned the same src to the same dest in this
+        // group, mark as duplicate. We intentionally ignore guard here since
+        // the request specifies same source/destination; extend if needed.
+        auto &srcSet = seen[dest];
+        if (srcSet.contains(src)) {
+          toErase.push_back(assign.getOperation());
+          continue;
+        }
+        srcSet.insert(src);
+      }
+
+      // Erase duplicates
+      for (Operation *dup : toErase)
+        dup->erase();
+    }
+  }
   return success();
 }
 

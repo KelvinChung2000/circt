@@ -146,8 +146,8 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   std::string symName = getOpUniqueName(op);
 
   // Create result types: left input, right input, output (all same width for
-  // binary ops)
-  SmallVector<Type> resultTypes = {resultType, resultType, resultType};
+  // binary ops). Use normalized integer type (no index types).
+  SmallVector<Type> resultTypes = {intType, intType, intType};
 
   // Find the parent component to create library operations at the component
   // level
@@ -222,10 +222,10 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   std::string symName = getOpUniqueName(op);
 
   // Create result types for pipelined operations: clk, reset, go, left, right,
-  // out, done
+  // out, done. Use normalized integer type (no index types).
   Type i1Type = rewriter.getI1Type();
-  SmallVector<Type> resultTypes = {i1Type,     i1Type,     i1Type, resultType,
-                                   resultType, resultType, i1Type};
+  SmallVector<Type> resultTypes = {i1Type,  i1Type,  i1Type, intType,
+                                   intType, intType, i1Type};
 
   auto topLevelOp = op->template getParentOfType<calyx::ComponentOp>();
   auto wiresOp = topLevelOp.getWiresOp();
@@ -446,8 +446,8 @@ LogicalResult ArithSelectToCalyxPattern::matchAndRewrite(
   // Create a simple symbol name using the general utility function
   std::string symName = getOpUniqueName(op);
 
-  SmallVector<Type> resultTypes = {rewriter.getI1Type(), resultType, resultType,
-                                   resultType};
+  SmallVector<Type> resultTypes = {rewriter.getI1Type(), intType, intType,
+                                   intType};
 
   // Find the parent component to create library operations at the component
   // level

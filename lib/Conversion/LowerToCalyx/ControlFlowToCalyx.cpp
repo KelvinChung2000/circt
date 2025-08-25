@@ -213,6 +213,10 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
     for (auto &op : llvm::make_early_inc_range(elseBlock)) {
       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
         auto operands = yieldOp.getOperands();
+        if (operands.size() == 0) {
+          rewriter.eraseOp(yieldOp);
+        }
+
         for (size_t i = 0; i < operands.size(); ++i) {
           auto yieldValue = operands[i];
           // Get the corresponding register for this yield value
