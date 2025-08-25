@@ -124,8 +124,14 @@ using ArithTruncIToCalyxPattern =
 // Special operations
 using ArithConstantToCalyxPattern =
     ArithSpecialOpToCalyxPattern<mlir::arith::ConstantOp>;
-using ArithSelectToCalyxPattern =
-    ArithSpecialOpToCalyxPattern<mlir::arith::SelectOp>;
+struct ArithSelectToCalyxPattern
+    : mlir::OpConversionPattern<mlir::arith::SelectOp> {
+  using mlir::OpConversionPattern<mlir::arith::SelectOp>::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::arith::SelectOp op,
+                  mlir::arith::SelectOp::Adaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override;
+};
 // Dedicated IndexCast pattern class
 struct ArithIndexCastToCalyxPattern
     : mlir::OpConversionPattern<mlir::arith::IndexCastOp> {

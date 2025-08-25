@@ -120,20 +120,28 @@ std::string getOpUniqueName(mlir::Operation *op) {
   //   }
   // }
 
+  std::string outName;
   // Fallback 1: Try to use line number from location
   if (auto fileLoc = dyn_cast<mlir::FileLineColLoc>(op->getLoc())) {
-    return opName + "_line_" + std::to_string(fileLoc.getLine());
+    outName = opName + "_line_" + std::to_string(fileLoc.getLine());
   } else if (auto fusedLoc = dyn_cast<mlir::FusedLoc>(op->getLoc())) {
     // Try to extract line number from fused location
     for (auto loc : fusedLoc.getLocations()) {
       if (auto fileLoc = dyn_cast<mlir::FileLineColLoc>(loc)) {
-        return opName + "_line_" + std::to_string(fileLoc.getLine());
+        outName = opName + "_line_" + std::to_string(fileLoc.getLine());
       }
     }
+  } else {
+    outName = opName + "_" + std::to_string(reinterpret_cast<uintptr_t>(op));
   }
 
-  // Fallback 2: Use memory address as last resort
-  return opName + "_" + std::to_string(reinterpret_cast<uintptr_t>(op));
+  if (usedName.count(outName)) {
+    usedName[outName]++;
+  } else {
+    usedName[outName] = 0;
+  }
+
+  return outName + "_" + std::to_string(usedName[outName]);
 }
 
 // Helper function to check if a value originates from a constant or parent

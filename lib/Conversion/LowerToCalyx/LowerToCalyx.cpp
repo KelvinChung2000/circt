@@ -30,6 +30,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/Support/Casting.h"
 #include <cassert>
 
 using namespace circt;
@@ -51,6 +52,62 @@ namespace lowertocalyx {
 
 namespace {
 
+// Helper to materialize casts between index and integer types in a
+// DataLayout-aware way. Handles:
+//   - index -> iN: index_cast to i[idxWidth], then ext/trunc to iN
+//   - iN -> index: ext/trunc to i[idxWidth], then index_cast to index
+static Value materializeIndexIntegerCast(OpBuilder &builder, Type resultType,
+                                         ValueRange inputs, Location loc) {
+  if (inputs.size() != 1)
+    return nullptr;
+
+  Value input = inputs[0];
+  MLIRContext *ctx = builder.getContext();
+
+  // Choose a conservative default for index bitwidth.
+  // If needed, this can be enhanced to query DataLayout when available.
+  unsigned idxWidth = 64;
+  auto iIdxTy = IntegerType::get(ctx, idxWidth);
+
+  // index -> integer
+  if (llvm::isa<IndexType>(input.getType())) {
+    if (auto resIntTy = llvm::dyn_cast<IntegerType>(resultType)) {
+      // First cast index to the data-layout-sized integer.
+      Value asIIdx =
+          builder.create<arith::IndexCastOp>(loc, iIdxTy, input).getResult();
+      unsigned tgtWidth = resIntTy.getWidth();
+      if (tgtWidth == idxWidth)
+        return asIIdx;
+      if (tgtWidth < idxWidth)
+        return builder.create<arith::TruncIOp>(loc, resIntTy, asIIdx)
+            .getResult();
+      // Default to zero-extend. Switch to ExtSIOp if signed semantics needed.
+      return builder.create<arith::ExtUIOp>(loc, resIntTy, asIIdx).getResult();
+    }
+    return nullptr;
+  }
+
+  // integer -> index
+  if (auto inIntTy = llvm::dyn_cast<IntegerType>(input.getType())) {
+    if (llvm::isa<IndexType>(resultType)) {
+      Value widthAdjusted = input;
+      unsigned inWidth = inIntTy.getWidth();
+      if (inWidth != idxWidth) {
+        if (inWidth < idxWidth)
+          widthAdjusted =
+              builder.create<arith::ExtUIOp>(loc, iIdxTy, input).getResult();
+        else
+          widthAdjusted =
+              builder.create<arith::TruncIOp>(loc, iIdxTy, input).getResult();
+      }
+      return builder.create<arith::IndexCastOp>(loc, resultType, widthAdjusted)
+          .getResult();
+    }
+  }
+
+  return nullptr;
+}
+
 class LowerToCalyxPass
     : public circt::impl::LowerToCalyxBase<LowerToCalyxPass> {
 public:
@@ -58,7 +115,6 @@ public:
   LowerToCalyxPass(std::string topLevelFunction) {
     topLevelFunctionOpt = std::move(topLevelFunction);
   }
-
   void runOnOperation() override;
 
 private:
@@ -105,6 +161,9 @@ private:
 //===----------------------------------------------------------------------===//
 
 void LowerToCalyxPass::runOnOperation() {
+
+  usedName = std::map<std::string, int>();
+
   ModuleOp moduleOp = getOperation();
 
   if (moduleOp.getOps<mlir::func::FuncOp>().empty()) {
@@ -190,42 +249,14 @@ LogicalResult LowerToCalyxPass::applyControlFlowConversion(ModuleOp moduleOp) {
   typeConverter.addSourceMaterialization([](OpBuilder &builder, Type resultType,
                                             ValueRange inputs,
                                             Location loc) -> Value {
-    if (inputs.size() != 1) {
-      return nullptr;
-    }
-    Value input = inputs[0];
-
-    // Handle index to i32 conversion
-    if (input.getType().isIndex() && isa<IntegerType>(resultType)) {
-      auto intType = cast<IntegerType>(resultType);
-      if (intType.getWidth() == 32) {
-        return builder.create<arith::IndexCastOp>(loc, resultType, input)
-            .getResult();
-      }
-    }
-
-    return nullptr;
+    return materializeIndexIntegerCast(builder, resultType, inputs, loc);
   });
 
   // Add target materialization (when converting from target to original type)
   typeConverter.addTargetMaterialization([](OpBuilder &builder, Type resultType,
                                             ValueRange inputs,
                                             Location loc) -> Value {
-    if (inputs.size() != 1) {
-      return nullptr;
-    }
-    Value input = inputs[0];
-
-    // Handle i32 to index conversion
-    if (resultType.isIndex() && isa<IntegerType>(input.getType())) {
-      auto intType = cast<IntegerType>(input.getType());
-      if (intType.getWidth() == 32) {
-        return builder.create<arith::IndexCastOp>(loc, resultType, input)
-            .getResult();
-      }
-    }
-
-    return nullptr;
+    return materializeIndexIntegerCast(builder, resultType, inputs, loc);
   });
 
   // Add SCF and Affine to Calyx conversion patterns
@@ -398,39 +429,13 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
   typeConverter.addSourceMaterialization([](OpBuilder &builder, Type resultType,
                                             ValueRange inputs,
                                             Location loc) -> Value {
-    if (inputs.size() != 1)
-      return nullptr;
-    Value input = inputs[0];
-    // index -> i32 (source side when original IR had index)
-    // Handle index to i32 conversion
-    if (input.getType().isIndex() && isa<IntegerType>(resultType)) {
-      auto intType = cast<IntegerType>(resultType);
-      if (intType.getWidth() == 32) {
-        return builder.create<arith::IndexCastOp>(loc, resultType, input)
-            .getResult();
-      }
-    }
-    return nullptr;
+    return materializeIndexIntegerCast(builder, resultType, inputs, loc);
   });
 
   typeConverter.addTargetMaterialization([](OpBuilder &builder, Type resultType,
                                             ValueRange inputs,
                                             Location loc) -> Value {
-    if (inputs.size() != 1) {
-      return nullptr;
-    }
-    Value input = inputs[0];
-
-    // Handle i32 to index conversion
-    if (resultType.isIndex() && isa<IntegerType>(input.getType())) {
-      auto intType = cast<IntegerType>(input.getType());
-      if (intType.getWidth() == 32) {
-        return builder.create<arith::IndexCastOp>(loc, resultType, input)
-            .getResult();
-      }
-    }
-
-    return nullptr;
+    return materializeIndexIntegerCast(builder, resultType, inputs, loc);
   });
   // Add arithmetic patterns directly
   patterns.add<lowertocalyx::ArithAddIToCalyxPattern,
@@ -441,6 +446,10 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
                lowertocalyx::ArithXOrIToCalyxPattern,
                lowertocalyx::ArithExtSIToCalyxPattern,
                lowertocalyx::ArithTruncIToCalyxPattern,
+               lowertocalyx::ArithDivSIToCalyxPattern,
+               lowertocalyx::ArithDivUIToCalyxPattern,
+               lowertocalyx::ArithRemSIToCalyxPattern,
+               lowertocalyx::ArithRemUIToCalyxPattern,
                lowertocalyx::ArithCmpIToCalyxPattern,
                lowertocalyx::ArithConstantToCalyxPattern,
                lowertocalyx::ArithIndexCastToCalyxPattern,
@@ -449,7 +458,6 @@ LogicalResult LowerToCalyxPass::applyArithPatterns(ModuleOp moduleOp) {
                lowertocalyx::ArithShLIToCalyxPattern,
                lowertocalyx::ArithSelectToCalyxPattern>(typeConverter,
                                                         &getContext());
-  moduleOp.dump();
   return applyPartialConversion(moduleOp, target, std::move(patterns));
 }
 

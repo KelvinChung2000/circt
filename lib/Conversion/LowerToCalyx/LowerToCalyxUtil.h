@@ -6,9 +6,15 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Region.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include <set>
 
 namespace circt {
 namespace lowertocalyx {
+
+namespace {
+std::map<std::string, int> usedName;
+
+}
 
 /// Helper function to safely move a region's content to another region
 /// This handles the common case of moving blocks between operations
@@ -141,13 +147,12 @@ mlir::Operation *getOrCreateOperation(mlir::Operation *parentOp,
 /// The componentOp parameter is used to find an appropriate location for
 /// creating the slice operation, and uniqueName helps create unique slice
 /// operation names.
-mlir::Value convertValueForToMatchType(mlir::Value addressPort,
-                                       mlir::Value indexValue,
-                                       circt::calyx::WiresOp wiresOp,
-                                       mlir::OpBuilder &wiresBuilder,
-                                       llvm::StringRef uniqueName,
-                                       mlir::Location loc,
-                                       mlir::ConversionPatternRewriter &rewriter);
+mlir::Value
+convertValueForToMatchType(mlir::Value addressPort, mlir::Value indexValue,
+                           circt::calyx::WiresOp wiresOp,
+                           mlir::OpBuilder &wiresBuilder,
+                           llvm::StringRef uniqueName, mlir::Location loc,
+                           mlir::ConversionPatternRewriter &rewriter);
 
 } // namespace lowertocalyx
 } // namespace circt

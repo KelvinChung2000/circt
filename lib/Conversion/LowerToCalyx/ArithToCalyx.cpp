@@ -125,18 +125,22 @@ ArithBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   Value rhs = adaptor.getRhs();
 
   // Get the result type width
-  // Use the TypeConverter to convert result types (e.g., index -> i32)
+  // Canonicalize result type: apply TypeConverter (if any), map index -> i32,
+  // and obtain an IntegerType. Implemented as a small lambda to avoid
+  // duplicating this logic.
+  auto normalizeToIntegerType = [&](Type t) -> IntegerType {
+    Type ty = t;
+    if (auto *tc = this->getTypeConverter())
+      if (Type converted = tc->convertType(ty))
+        ty = converted;
+    if (isa<IndexType>(ty))
+      ty = IntegerType::get(op.getContext(), 32);
+    return dyn_cast<IntegerType>(ty);
+  };
   Type resultType = op.getResult().getType();
-  if (auto *tc = this->getTypeConverter())
-    if (Type converted = tc->convertType(resultType))
-      resultType = converted;
-  // Normalize any lingering index types to i32 for width reasoning
-  if (isa<IndexType>(resultType))
-    resultType = IntegerType::get(op.getContext(), 32);
-  auto intType = dyn_cast<IntegerType>(resultType);
-  if (!intType) {
+  auto intType = normalizeToIntegerType(resultType);
+  if (!intType)
     return rewriter.notifyMatchFailure(op, "Only integer types supported");
-  }
 
   // Create a simple symbol name using the general utility function
   std::string symName = getOpUniqueName(op);
@@ -197,18 +201,20 @@ ArithPipelinedBinaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   Value rhs = adaptor.getRhs();
 
   // Get the result type width
-  // Use the TypeConverter to convert result types (e.g., index -> i32)
+  // Canonicalize result type (lambda as above).
+  auto normalizeToIntegerType = [&](Type t) -> IntegerType {
+    Type ty = t;
+    if (auto *tc = this->getTypeConverter())
+      if (Type converted = tc->convertType(ty))
+        ty = converted;
+    if (isa<IndexType>(ty))
+      ty = IntegerType::get(op.getContext(), 32);
+    return dyn_cast<IntegerType>(ty);
+  };
   Type resultType = op.getResult().getType();
-  if (auto *tc = this->getTypeConverter())
-    if (Type converted = tc->convertType(resultType))
-      resultType = converted;
-  // Normalize any lingering index types to i32 for width reasoning
-  if (isa<IndexType>(resultType))
-    resultType = IntegerType::get(op.getContext(), 32);
-  auto intType = dyn_cast<IntegerType>(resultType);
-  if (!intType) {
+  auto intType = normalizeToIntegerType(resultType);
+  if (!intType)
     return rewriter.notifyMatchFailure(op, "Only integer types supported");
-  }
 
   // Width may be used later for pipelined operations
 
@@ -344,7 +350,7 @@ ArithUnaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
 
 // Template function implementation for comparison operations
 LogicalResult ArithCmpIToCalyxPattern::matchAndRewrite(
-    arith::CmpIOp op, typename arith::CmpIOp::Adaptor adaptor,
+    arith::CmpIOp op, arith::CmpIOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
 
   // Get operation location and operands
@@ -353,25 +359,29 @@ LogicalResult ArithCmpIToCalyxPattern::matchAndRewrite(
   Value rhs = adaptor.getRhs();
 
   // Get the result type width
-  // Use the TypeConverter to convert result types (e.g., index -> i32)
-  Type resultType = op.getResult().getType();
-  if (auto *tc = this->getTypeConverter())
-    if (Type converted = tc->convertType(resultType))
-      resultType = converted;
-  // Normalize any lingering index types to i32 for width reasoning
-  if (isa<IndexType>(resultType))
-    resultType = IntegerType::get(op.getContext(), 32);
-  auto intType = dyn_cast<IntegerType>(resultType);
-  if (!intType) {
+  // Canonicalize operand/result width using a lambda (apply TypeConverter,
+  // map index -> i32).
+  auto normalizeToIntegerType = [&](Type t) -> IntegerType {
+    Type ty = t;
+    if (auto *tc = this->getTypeConverter())
+      if (Type converted = tc->convertType(ty))
+        ty = converted;
+    if (isa<IndexType>(ty))
+      ty = IntegerType::get(op.getContext(), 32);
+    return dyn_cast<IntegerType>(ty);
+  };
+
+  Type lResultType = normalizeToIntegerType(lhs.getType());
+  Type rResultType = normalizeToIntegerType(rhs.getType());
+  if (!lResultType || !rResultType)
     return rewriter.notifyMatchFailure(op, "Only integer types supported");
-  }
 
   // Create a simple symbol name using the general utility function
   std::string symName = getOpUniqueName(op);
 
   // Create result types: left input, right input, output (all same width for
   // binary ops)
-  SmallVector<Type> resultTypes = {resultType, resultType,
+  SmallVector<Type> resultTypes = {lResultType, rResultType,
                                    rewriter.getI1Type()};
 
   // Find the parent component to create library operations at the component
@@ -403,6 +413,65 @@ LogicalResult ArithCmpIToCalyxPattern::matchAndRewrite(
   // Replace the original arith operation result with the library operation
   // output
   rewriter.replaceOp(op, outPort);
+
+  return success();
+}
+
+LogicalResult ArithSelectToCalyxPattern::matchAndRewrite(
+    arith::SelectOp op, arith::SelectOp::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+
+  // Get operation location and operands
+  auto loc = op.getLoc();
+  Value lhs = adaptor.getTrueValue();
+  Value rhs = adaptor.getFalseValue();
+  Value cond = adaptor.getCondition();
+
+  // Get the result type width
+  // Canonicalize result type (lambda).
+  auto normalizeToIntegerType = [&](Type t) -> IntegerType {
+    Type ty = t;
+    if (auto *tc = this->getTypeConverter())
+      if (Type converted = tc->convertType(ty))
+        ty = converted;
+    if (isa<IndexType>(ty))
+      ty = IntegerType::get(op.getContext(), 32);
+    return dyn_cast<IntegerType>(ty);
+  };
+  Type resultType = op.getResult().getType();
+  auto intType = normalizeToIntegerType(resultType);
+  if (!intType)
+    return rewriter.notifyMatchFailure(op, "Only integer types supported");
+
+  // Create a simple symbol name using the general utility function
+  std::string symName = getOpUniqueName(op);
+
+  SmallVector<Type> resultTypes = {rewriter.getI1Type(), resultType, resultType,
+                                   resultType};
+
+  // Find the parent component to create library operations at the component
+  // level
+  calyx::ComponentOp topLevelOp =
+      op->template getParentOfType<calyx::ComponentOp>();
+  auto wiresOp = topLevelOp.getWiresOp();
+
+  // Create the library operation inside the wires operation
+  OpBuilder componentBuilder(wiresOp);
+  auto muxOp = componentBuilder.create<calyx::MuxLibOp>(
+      loc, componentBuilder.getStringAttr(symName), resultTypes);
+
+  // Create assign operations in the wires section (not in groups)
+  // Use the same wiresBlock we created the library operation in
+  auto &wiresBlock = wiresOp.getBodyRegion().front();
+  OpBuilder wiresBuilder(&wiresBlock, wiresBlock.end());
+
+  wiresBuilder.create<calyx::AssignOp>(loc, muxOp.getTru(), lhs);
+  wiresBuilder.create<calyx::AssignOp>(loc, muxOp.getFal(), rhs);
+  wiresBuilder.create<calyx::AssignOp>(loc, muxOp.getCond(), cond);
+
+  // Replace the original arith operation result with the library operation
+  // output
+  rewriter.replaceOp(op, muxOp.getOut());
 
   return success();
 }

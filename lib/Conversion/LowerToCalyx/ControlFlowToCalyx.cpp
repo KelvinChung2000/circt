@@ -67,11 +67,6 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
     mlir::scf::IfOp ifOp, mlir::scf::IfOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
 
-  // Skip if this if operation doesn't have results
-  if (ifOp.getNumResults() == 0) {
-    return success();
-  }
-
   // Get the condition and create register for this if operation
   Value condition = ifOp.getCondition();
 
