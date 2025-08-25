@@ -477,73 +477,58 @@ LogicalResult ArithSelectToCalyxPattern::matchAndRewrite(
 }
 
 // Template function implementation for special operations
-template <typename OpType>
-LogicalResult ArithSpecialOpToCalyxPattern<OpType>::matchAndRewrite(
-    OpType op, typename OpType::Adaptor adaptor,
+LogicalResult ArithConstantToCalyxPattern::matchAndRewrite(
+    mlir::arith::ConstantOp op, mlir::arith::ConstantOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
 
-  // Handle arith.constant operations
-  if (isa<mlir::arith::ConstantOp>(op)) {
-    auto constOp = cast<mlir::arith::ConstantOp>(op);
-    auto loc = op.getLoc();
-    auto value = constOp.getValue();
-    auto type = constOp.getType();
+  auto loc = op.getLoc();
+  auto value = op.getValue();
+  auto type = op.getType();
 
-    // Find the parent component to create constant at the component level
-    auto componentOp = op->template getParentOfType<calyx::ComponentOp>();
-    if (!componentOp) {
-      return rewriter.notifyMatchFailure(
-          op, "Constant operation not within a calyx.component");
-    }
+  // Find the parent component to create constant at the component level
+  auto componentOp = op->template getParentOfType<calyx::ComponentOp>();
+  if (!componentOp) {
+    return rewriter.notifyMatchFailure(
+        op, "Constant operation not within a calyx.component");
+  }
 
-    // Create the constant at the component level (before wires section)
-    auto wiresOp =
-        *componentOp.getBodyBlock()->template getOps<calyx::WiresOp>().begin();
-    OpBuilder componentBuilder(rewriter.getContext());
-    componentBuilder.setInsertionPoint(wiresOp);
+  // Create the constant at the component level (before wires section)
+  auto wiresOp =
+      *componentOp.getBodyBlock()->template getOps<calyx::WiresOp>().begin();
+  OpBuilder componentBuilder(rewriter.getContext());
+  componentBuilder.setInsertionPoint(wiresOp);
 
-    // Handle constants following the same pattern as SCFToCalyx
-    if (auto intAttr = dyn_cast<IntegerAttr>(value)) {
-      // Integer constants use hw::ConstantOp (as per SCFToCalyx)
-      // Use getOrCreateConstant utility to deduplicate constants
+  // Handle constants following the same pattern as SCFToCalyx
+  if (auto intAttr = dyn_cast<IntegerAttr>(value)) {
+    // Integer constants use hw::ConstantOp (as per SCFToCalyx)
+    // Use getOrCreateConstant utility to deduplicate constants
 
-      // Handle bit width calculation - index types should have been converted
-      // to i32
-      unsigned bitWidth;
-      if (intAttr.getType().isIndex()) {
-        // Index types are converted to i32 by the index conversion pass
-        bitWidth = 32;
-      } else {
-        bitWidth = intAttr.getType().getIntOrFloatBitWidth();
-      }
-
-      auto constantValue = getOrCreateConstant(componentOp.getOperation(),
-                                               intAttr.getInt(), bitWidth);
-      rewriter.replaceOp(op, constantValue);
-      return success();
-    } else if (auto floatAttr = dyn_cast<FloatAttr>(value)) {
-      // Floating point constants use calyx::ConstantOp (as per SCFToCalyx)
-      std::string constName = getOpUniqueName(op);
-      auto calyxConst = componentBuilder.create<calyx::ConstantOp>(
-          loc, componentBuilder.getStringAttr(constName), floatAttr, type);
-      rewriter.replaceOp(op, calyxConst.getOut());
-      return success();
+    // Handle bit width calculation - index types should have been converted
+    // to i32
+    unsigned bitWidth;
+    if (intAttr.getType().isIndex()) {
+      // Index types are converted to i32 by the index conversion pass
+      bitWidth = 32;
     } else {
-      return rewriter.notifyMatchFailure(
-          op, "Unsupported constant type - only integer and float constants "
-              "supported");
+      bitWidth = intAttr.getType().getIntOrFloatBitWidth();
     }
-  }
 
-  // Handle other special operations like select
-  if (isa<mlir::arith::SelectOp>(op)) {
-    // TODO: Implement select operation conversion
-    return rewriter.notifyMatchFailure(op,
-                                       "Select operation not yet implemented");
+    auto constantValue = getOrCreateConstant(componentOp.getOperation(),
+                                             intAttr.getInt(), bitWidth);
+    rewriter.replaceOp(op, constantValue);
+    return success();
+  } else if (auto floatAttr = dyn_cast<FloatAttr>(value)) {
+    // Floating point constants use calyx::ConstantOp (as per SCFToCalyx)
+    std::string constName = getOpUniqueName(op);
+    auto calyxConst = componentBuilder.create<calyx::ConstantOp>(
+        loc, componentBuilder.getStringAttr(constName), floatAttr, type);
+    rewriter.replaceOp(op, calyxConst.getOut());
+    return success();
+  } else {
+    return rewriter.notifyMatchFailure(
+        op, "Unsupported constant type - only integer and float constants "
+            "supported");
   }
-
-  return rewriter.notifyMatchFailure(
-      op, "Unsupported special arithmetic operation");
 }
 
 // Explicit template instantiations for binary integer arithmetic operations
@@ -646,13 +631,6 @@ LogicalResult ArithIndexCastToCalyxPattern::matchAndRewrite(
   }
   return success();
 }
-
-// Explicit template instantiations for special operations (after
-// specializations)
-template struct ArithSpecialOpToCalyxPattern<mlir::arith::ConstantOp>;
-template struct ArithSpecialOpToCalyxPattern<mlir::arith::SelectOp>;
-// Note: IndexCast uses template specialization above, no explicit instantiation
-// needed
 
 } // namespace lowertocalyx
 } // namespace circt

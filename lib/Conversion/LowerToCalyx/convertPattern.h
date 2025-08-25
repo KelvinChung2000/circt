@@ -61,11 +61,12 @@ struct ArithCmpIToCalyxPattern : mlir::OpConversionPattern<arith::CmpIOp> {
                   mlir::ConversionPatternRewriter &rewriter) const override;
 };
 
-template <typename SourceType>
-struct ArithSpecialOpToCalyxPattern : mlir::OpConversionPattern<SourceType> {
-  using mlir::OpConversionPattern<SourceType>::OpConversionPattern;
+struct ArithConstantToCalyxPattern
+    : mlir::OpConversionPattern<arith::ConstantOp> {
+  using mlir::OpConversionPattern<arith::ConstantOp>::OpConversionPattern;
   mlir::LogicalResult
-  matchAndRewrite(SourceType op, typename SourceType::Adaptor adaptor,
+  matchAndRewrite(arith::ConstantOp op,
+                  typename arith::ConstantOp::Adaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override;
 };
 
@@ -121,9 +122,6 @@ using ArithTruncIToCalyxPattern =
 
 // Comparison operations - TODO: Need proper Calyx comparison operations
 
-// Special operations
-using ArithConstantToCalyxPattern =
-    ArithSpecialOpToCalyxPattern<mlir::arith::ConstantOp>;
 struct ArithSelectToCalyxPattern
     : mlir::OpConversionPattern<mlir::arith::SelectOp> {
   using mlir::OpConversionPattern<mlir::arith::SelectOp>::OpConversionPattern;
