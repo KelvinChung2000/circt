@@ -775,57 +775,72 @@ LogicalResult LowerToCalyxPass::applyEmptyGroupOptimization(ModuleOp moduleOp) {
 }
 
 LogicalResult LowerToCalyxPass::applyControlFlowWrapping(ModuleOp moduleOp) {
-  ConversionTarget target(getContext());
-  target.addLegalDialect<calyx::CalyxDialect, arith::ArithDialect,
-                         comb::CombDialect, hw::HWDialect>();
+  // Flat walker that ensures every control region has a single seq wrapping
+  // its immediate ops, and recurses into nested control ops.
+  auto ensureSeqWrap = [&](Region &region) -> calyx::SeqOp {
+    if (region.empty())
+      return nullptr;
+    Block &block = region.front();
+    if (block.empty())
+      return nullptr;
 
-  // We want to convert control operations that need wrapping
-  target.addDynamicallyLegalOp<calyx::ControlOp>(
-      [](calyx::ControlOp controlOp) {
-        auto &controlRegion = controlOp.getBodyRegion();
-        if (controlRegion.empty()) {
-          return true; // Legal if empty
-        }
+    // If exactly one op and it's a seq, reuse it.
+    if (std::next(block.begin()) == block.end()) {
+      if (auto existingSeq = dyn_cast<calyx::SeqOp>(&block.front()))
+        return existingSeq;
+    }
 
-        auto &controlBlock = controlRegion.front();
-        if (controlBlock.empty()) {
-          return true; // Legal if empty
-        }
+    // Collect ops to move, create a seq, and move them under it.
+    SmallVector<Operation *> opsToMove;
+    for (Operation &op : block)
+      opsToMove.push_back(&op);
+    OpBuilder b(&block, block.begin());
+    auto seq = b.create<calyx::SeqOp>(opsToMove.front()->getLoc());
+    Block &seqBlock = seq.getBodyRegion().front();
+    for (Operation *op : opsToMove)
+      op->moveBefore(&seqBlock, seqBlock.end());
+    return seq;
+  };
 
-        // Check if we need wrapping - look for problematic patterns
-        size_t numOperations = 0;
-        bool hasStandaloneEnable = false;
+  std::function<void(Region &)> processRegion;
+  processRegion = [&](Region &region) {
+    if (region.empty())
+      return;
+    calyx::SeqOp seqHere = ensureSeqWrap(region);
+    Block *walkBlock =
+        seqHere ? &seqHere.getBodyRegion().front() : &region.front();
 
-        for (auto &op : controlBlock) {
-          if (!isa<calyx::ControlOp>(op)) { // Don't count the terminator
-            numOperations++;
-            if (isa<calyx::EnableOp>(op)) {
-              hasStandaloneEnable = true;
-            }
-          }
-        }
+    SmallVector<Operation *> ops;
+    for (Operation &op : *walkBlock)
+      ops.push_back(&op);
+    for (Operation *op : ops) {
+      if (auto ifOp = dyn_cast<calyx::IfOp>(op)) {
+        ensureSeqWrap(ifOp.getThenRegion());
+        if (!ifOp.getElseRegion().empty())
+          ensureSeqWrap(ifOp.getElseRegion());
+        processRegion(ifOp.getThenRegion());
+        if (!ifOp.getElseRegion().empty())
+          processRegion(ifOp.getElseRegion());
+      } else if (auto rep = dyn_cast<calyx::RepeatOp>(op)) {
+        ensureSeqWrap(rep.getBodyRegion());
+        processRegion(rep.getBodyRegion());
+      } else if (auto wh = dyn_cast<calyx::WhileOp>(op)) {
+        ensureSeqWrap(wh.getBodyRegion());
+        processRegion(wh.getBodyRegion());
+      } else if (auto seqInner = dyn_cast<calyx::SeqOp>(op)) {
+        processRegion(seqInner.getBodyRegion());
+      } else if (auto parInner = dyn_cast<calyx::ParOp>(op)) {
+        for (Region &r : op->getRegions())
+          processRegion(r);
+      }
+    }
+  };
 
-        // Legal if we don't need wrapping
-        bool needsWrapping = (numOperations > 1 && hasStandaloneEnable) ||
-                             (numOperations == 1 && hasStandaloneEnable);
-        return !needsWrapping;
-      });
-
-  // Control flow wrapping operates only on control operations
-  // Empty group optimization is now handled in a separate pass
-
-  RewritePatternSet patterns(&getContext());
-
-  // Set up type converter
-  TypeConverter typeConverter;
-  typeConverter.addConversion([](Type type) -> Type { return type; });
-
-  // Add control flow wrapping patterns
-  // Note: Empty group optimization disabled due to rewriter conflicts
-  patterns.add<lowertocalyx::ControlFlowWrappingPattern>(typeConverter,
-                                                         &getContext());
-
-  return applyPartialConversion(moduleOp, target, std::move(patterns));
+  for (auto componentOp : moduleOp.getOps<calyx::ComponentOp>()) {
+    if (auto controlOp = componentOp.getControlOp())
+      processRegion(controlOp.getBodyRegion());
+  }
+  return success();
 }
 
 } // namespace

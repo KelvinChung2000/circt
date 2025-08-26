@@ -348,12 +348,12 @@ ArithUnaryOpToCalyxPattern<SourceType, TargetType>::matchAndRewrite(
   return success();
 }
 
-// Template function implementation for comparison operations
 LogicalResult ArithCmpIToCalyxPattern::matchAndRewrite(
     arith::CmpIOp op, arith::CmpIOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
 
   // Get operation location and operands
+  op.dump();
   auto loc = op.getLoc();
   Value lhs = adaptor.getLhs();
   Value rhs = adaptor.getRhs();
@@ -396,7 +396,6 @@ LogicalResult ArithCmpIToCalyxPattern::matchAndRewrite(
   // Create the appropriate Calyx library operation based on the predicate
   auto ports = createComparisonLibOp(op.getPredicate(), componentBuilder, loc,
                                      symName, resultTypes);
-
   // Use the ports from the helper function
   Value leftPort = ports.leftPort;
   Value rightPort = ports.rightPort;
@@ -412,8 +411,8 @@ LogicalResult ArithCmpIToCalyxPattern::matchAndRewrite(
 
   // Replace the original arith operation result with the library operation
   // output
-  rewriter.replaceOp(op, outPort);
-
+  rewriter.replaceAllUsesWith(op.getResult(), outPort);
+  op.erase();
   return success();
 }
 

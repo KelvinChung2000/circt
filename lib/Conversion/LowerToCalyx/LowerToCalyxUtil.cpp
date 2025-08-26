@@ -561,6 +561,54 @@ Value convertValueForToMatchType(Value lhs, Value rhs, calyx::WiresOp wiresOp,
   bool needExtend = srcW < dstW;
   SmallVector<Type> libTypes = {rhsType, lhsType};
 
+  // Try to reuse an existing Pad/Slice lib op that already slices/pads this
+  // exact rhs to the desired lhs type, similar to getOrCreateConstant.
+  // We search:
+  // 1) The component body for an existing PadLibOp/SliceLibOp with matching
+  //    input/output types, and
+  // 2) The wires region for an AssignOp that connects that lib op's input to
+  //    this rhs value.
+  // If found, reuse its out value. Otherwise, create a new lib op and wire it.
+
+  // Component body block (where the lib op lives just before wiresOp)
+  mlir::Block *compBody = wiresOp->getBlock();
+  auto &wiresBlock = wiresOp.getBodyRegion().front();
+
+  auto findExistingOut = [&]() -> Value {
+    for (Operation &op : compBody->getOperations()) {
+      if (needExtend) {
+        if (auto pad = dyn_cast<calyx::PadLibOp>(&op)) {
+          if (pad.getIn().getType() != rhsType ||
+              pad.getOut().getType() != lhsType)
+            continue;
+          // Check wiring: dest == pad.in, src == rhs
+          for (Operation &wop : wiresBlock.getOperations()) {
+            if (auto a = dyn_cast<calyx::AssignOp>(&wop)) {
+              if (a.getDest() == pad.getIn() && a.getSrc() == rhs)
+                return pad.getOut();
+            }
+          }
+        }
+      } else {
+        if (auto sl = dyn_cast<calyx::SliceLibOp>(&op)) {
+          if (sl.getIn().getType() != rhsType ||
+              sl.getOut().getType() != lhsType)
+            continue;
+          for (Operation &wop : wiresBlock.getOperations()) {
+            if (auto a = dyn_cast<calyx::AssignOp>(&wop)) {
+              if (a.getDest() == sl.getIn() && a.getSrc() == rhs)
+                return sl.getOut();
+            }
+          }
+        }
+      }
+    }
+    return Value();
+  };
+
+  if (Value existing = findExistingOut())
+    return existing;
+
   // Insert library op at component/wires op level (just before wiresOp).
   OpBuilder::InsertionGuard g1(rewriter);
   rewriter.setInsertionPoint(wiresOp);

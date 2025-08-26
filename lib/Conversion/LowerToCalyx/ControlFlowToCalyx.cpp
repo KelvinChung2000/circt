@@ -650,71 +650,61 @@ LogicalResult ControlFlowWrappingPattern::matchAndRewrite(
     ConversionPatternRewriter &rewriter) const {
 
   auto &controlRegion = controlOp.getBodyRegion();
-  if (controlRegion.empty()) {
-    return failure(); // Nothing to wrap
-  }
+  if (controlRegion.empty())
+    return failure();
 
   auto &controlBlock = controlRegion.front();
-  if (controlBlock.empty()) {
-    return failure(); // Nothing to wrap
-  }
+  if (controlBlock.empty())
+    return failure();
 
-  // Find the parent component to access groups in the wires section
-  auto componentOp = controlOp->getParentOfType<calyx::ComponentOp>();
-  if (!componentOp) {
-    return failure(); // No parent component found
-  }
+  bool changed = false;
 
-  // TODO: Before wrapping, check each enable signal and remove groups that only
-  // have done For now, this optimization is disabled to avoid rewriter issues
-  // Future work: Implement safe group removal that doesn't interfere with the
-  // rewriter pattern
+  auto wrapRegionWithSeq = [&](Region &region) {
+    if (region.empty())
+      return false;
+    Block &block = region.front();
+    if (block.empty())
+      return false;
+    // If already a single seq, skip
+    if (std::next(block.begin()) == block.end() &&
+        isa<calyx::SeqOp>(block.front()))
+      return false;
+    // Collect current ops to move before creating the seq op
+    SmallVector<Operation *> opsToMove;
+    for (Operation &op : block)
+      opsToMove.push_back(&op);
 
-  // Re-collect control operations after potential removals
-  SmallVector<Operation *> controlOps;
-  bool hasStandaloneEnable = false;
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointToStart(&block);
+    auto seq = rewriter.create<calyx::SeqOp>(opsToMove.front()->getLoc());
+    auto &seqBlock = seq.getBodyRegion().front();
+    // Move only the previously collected ops into the seq block
+    for (Operation *op : opsToMove)
+      op->moveBefore(&seqBlock, seqBlock.end());
+    return true;
+  };
 
-  for (auto &op : controlBlock) {
-    if (!isa<calyx::ControlOp>(op)) { // Don't count terminators
-      controlOps.push_back(&op);
-      if (isa<calyx::EnableOp>(op)) {
-        hasStandaloneEnable = true;
-      }
+  // Iterate top-level control ops and wrap their regions
+  for (Operation &op : llvm::make_early_inc_range(controlBlock)) {
+    if (auto ifOp = dyn_cast<calyx::IfOp>(&op)) {
+      changed |= wrapRegionWithSeq(ifOp.getThenRegion());
+      if (!ifOp.getElseRegion().empty())
+        changed |= wrapRegionWithSeq(ifOp.getElseRegion());
+      continue;
     }
+    if (auto rep = dyn_cast<calyx::RepeatOp>(&op)) {
+      changed |= wrapRegionWithSeq(rep.getBodyRegion());
+      continue;
+    }
+    if (auto wh = dyn_cast<calyx::WhileOp>(&op)) {
+      changed |= wrapRegionWithSeq(wh.getBodyRegion());
+      continue;
+    }
+    // For nested seq/par, we don't need to wrap; seq is already sequential.
+    // Optionally, could wrap bodies of par regions similarly if desired.
   }
 
-  // Need wrapping if:
-  // 1. We have standalone enables, OR
-  // 2. We have multiple control operations at the top level
-  bool needsWrapping = hasStandaloneEnable || (controlOps.size() > 1);
-
-  if (!needsWrapping) {
-    return failure(); // Pattern doesn't apply
-  }
-
-  // Create a calyx.seq to wrap all operations
-  auto loc = controlOp.getLoc();
-  OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(&controlBlock);
-
-  auto seqOp = rewriter.create<calyx::SeqOp>(loc);
-  auto &seqRegion = seqOp.getBodyRegion();
-  auto &seqBlock = seqRegion.front();
-
-  // Clone all control operations to the seq block
-  // This handles both standalone enables and multiple control operations
-  OpBuilder seqBuilder(&seqBlock, seqBlock.end());
-  IRMapping mapper;
-  for (auto *op : controlOps) {
-    seqBuilder.clone(*op, mapper);
-  }
-
-  // Erase the original operations from the control block
-  for (auto *op : controlOps) {
-    rewriter.eraseOp(op);
-  }
-
-  return success();
+  return changed ? success() : failure();
 }
 
 // Empty group optimization pattern implementation

@@ -21,42 +21,71 @@ using namespace mlir;
 namespace circt {
 namespace lowertocalyx {
 
-static void storeLowering(mlir::ConversionPatternRewriter &rewriter,
-                          mlir::memref::StoreOp &storeOp,
-                          circt::calyx::SeqMemoryOp &memOp,
-                          const mlir::Location &loc,
-                          circt::calyx::WiresOp &wiresOp,
-                          OpBuilder &wiresBuilder) {
+static std::string
+storeLowering(mlir::ConversionPatternRewriter &rewriter,
+              mlir::memref::StoreOp &storeOp, circt::calyx::SeqMemoryOp &memOp,
+              const mlir::Location &loc, circt::calyx::WiresOp &wiresOp,
+              Value constantOp, OpBuilder &wiresBuilder, bool inplace) {
 
+  auto p = wiresBuilder.saveInsertionPoint();
   Value addrPort = memOp.addrPort(0);
   Value indexValue = storeOp.getIndices()[0];
   Value convertedIndexValue =
       convertValueForToMatchType(addrPort, indexValue, wiresOp, wiresBuilder,
                                  getOpUniqueName(storeOp), loc, rewriter);
+  std::string group_name = getOpUniqueName(storeOp) + "_group";
+  if (inplace) {
+    auto g = wiresBuilder.create<calyx::GroupOp>(loc, group_name);
+    Block *gBlock = g.getBodyBlock();
+    wiresBuilder.setInsertionPoint(gBlock, gBlock->end());
+  }
   wiresBuilder.create<calyx::AssignOp>(loc, addrPort, convertedIndexValue);
   wiresBuilder.create<calyx::AssignOp>(loc, memOp.writeData(),
                                        storeOp.getValueToStore());
-  auto constantOp = getOrCreateConstant(wiresOp, 1, 1);
   wiresBuilder.create<calyx::AssignOp>(loc, memOp.writeEn(), constantOp);
+  if (inplace) {
+    wiresBuilder.create<calyx::GroupDoneOp>(loc, memOp.done());
+  }
   rewriter.eraseOp(storeOp);
+  wiresBuilder.restoreInsertionPoint(p);
+  return group_name;
 }
 
-static void loadLowering(mlir::ConversionPatternRewriter &rewriter,
-                         mlir::memref::LoadOp &loadOp,
-                         circt::calyx::SeqMemoryOp &memOp,
-                         const mlir::Location &loc,
-                         circt::calyx::WiresOp &wiresOp,
-                         OpBuilder &wiresBuilder) {
-
+static std::string
+loadLowering(mlir::ConversionPatternRewriter &rewriter,
+             mlir::memref::LoadOp &loadOp, circt::calyx::SeqMemoryOp &memOp,
+             const mlir::Location &loc, circt::calyx::WiresOp &wiresOp,
+             Value constantOp, OpBuilder &wiresBuilder, bool inplace) {
+  auto p = wiresBuilder.saveInsertionPoint();
   Value addrPort = memOp.addrPort(0);
   Value indexValue = loadOp.getIndices()[0];
   Value convertedIndexValue =
       convertValueForToMatchType(addrPort, indexValue, wiresOp, wiresBuilder,
                                  getOpUniqueName(loadOp), loc, rewriter);
+  std::string group_name = getOpUniqueName(loadOp) + "_group";
+  if (inplace) {
+    auto g = wiresBuilder.create<calyx::GroupOp>(loc, group_name);
+    Block *gBlock = g.getBodyBlock();
+    wiresBuilder.setInsertionPoint(gBlock, gBlock->end());
+  }
   wiresBuilder.create<calyx::AssignOp>(loc, addrPort, convertedIndexValue);
-  auto constantOp = getOrCreateConstant(wiresOp, 1, 1);
   wiresBuilder.create<calyx::AssignOp>(loc, memOp.contentEn(), constantOp);
-  rewriter.replaceOp(loadOp, memOp.readData());
+  if (inplace) {
+    auto compBuilder = OpBuilder(wiresOp);
+    auto outReg = compBuilder.create<calyx::RegisterOp>(
+        loc, getOpUniqueName(loadOp) + "_reg", memOp.readData().getType());
+
+    wiresBuilder.create<calyx::AssignOp>(loc, outReg.getIn(), memOp.readData());
+    wiresBuilder.create<calyx::AssignOp>(loc, outReg.getWriteEn(),
+                                         memOp.done());
+
+    wiresBuilder.create<calyx::GroupDoneOp>(loc, outReg.getDone());
+    rewriter.replaceOp(loadOp, outReg.getOut());
+  } else {
+    rewriter.replaceOp(loadOp, memOp.readData());
+  }
+  wiresBuilder.restoreInsertionPoint(p);
+  return group_name;
 }
 
 LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
@@ -208,14 +237,17 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
     std::string memName = "mem_arg_" + std::to_string(argIndex);
     auto memOp = componentBuilder.create<calyx::SeqMemoryOp>(
         loc, memName, elementWidth, sizes, addrSizes);
+    auto constantOp = getOrCreateConstant(componentOp, 1, 1);
     // Prepare builders: componentBuilder already set before wiresOp; create a
     // dedicated wiresBuilder pointing at end of wires body.
     if (memrefUses.size() == 1) {
       if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(memrefUses[idx][0])) {
-        loadLowering(rewriter, loadOp, memOp, loc, wiresOp, wiresBuilder);
+        loadLowering(rewriter, loadOp, memOp, loc, wiresOp, constantOp,
+                     wiresBuilder, false);
       } else if (auto storeOp =
                      dyn_cast<mlir::memref::StoreOp>(memrefUses[idx][0])) {
-        storeLowering(rewriter, storeOp, memOp, loc, wiresOp, wiresBuilder);
+        storeLowering(rewriter, storeOp, memOp, loc, wiresOp, constantOp,
+                      wiresBuilder, false);
       } else {
         return rewriter.notifyMatchFailure(
             op, "Unexpected memref use type for argument " +
@@ -225,10 +257,14 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
       for (Operation *useOp : memrefUses[idx]) {
         if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(useOp)) {
           inplaceBuilder.setInsertionPointAfter(loadOp);
-          loadLowering(rewriter, loadOp, memOp, loc, wiresOp, inplaceBuilder);
+          auto g = loadLowering(rewriter, loadOp, memOp, loc, wiresOp,
+                                constantOp, wiresBuilder, true);
+          inplaceBuilder.create<calyx::EnableOp>(loc, g);
         } else if (auto storeOp = dyn_cast<mlir::memref::StoreOp>(useOp)) {
           inplaceBuilder.setInsertionPointAfter(storeOp);
-          storeLowering(rewriter, storeOp, memOp, loc, wiresOp, inplaceBuilder);
+          auto g = storeLowering(rewriter, storeOp, memOp, loc, wiresOp,
+                                 constantOp, wiresBuilder, true);
+          inplaceBuilder.create<calyx::EnableOp>(loc, g);
         }
       }
     }
