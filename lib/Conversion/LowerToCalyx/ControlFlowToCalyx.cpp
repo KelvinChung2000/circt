@@ -202,7 +202,6 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
           // Create group_done
           rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
         }
-        rewriter.eraseOp(yieldOp);
       }
     }
   }
@@ -240,11 +239,22 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
                                            invertedCondition.getOut());
           // Create group_done
           rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
-          rewriter.eraseOp(yieldOp);
         }
       }
     }
   }
+  // Replace the scf.if with the calyx.if, providing the register output as the
+  // result
+  for (size_t i = 0; i < ifResultsRegs.size(); ++i) {
+    // Connect the calyx.if result to the register output
+    ifOp.getResult(i).replaceAllUsesWith(ifResultsRegs[i].getOut());
+  }
+
+  ifOp.walk([](mlir::Operation *op) {
+    if (isa<mlir::scf::YieldOp>(op)) {
+      op->erase();
+    }
+  });
 
   // Now replace the scf.if with calyx.if
   rewriter.setInsertionPoint(ifOp);
@@ -267,14 +277,6 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
                                           sourceElseBlock.getOperations());
   }
 
-  // Replace the scf.if with the calyx.if, providing the register output as the
-  // result
-  for (size_t i = 0; i < ifResultsRegs.size(); ++i) {
-    // Get the register for this result
-    auto &resultReg = ifResultsRegs[i];
-    // Connect the calyx.if result to the register output
-    ifOp.getResult(i).replaceAllUsesWith(resultReg.getOut());
-  }
   ifOp.erase();
   return success();
 }

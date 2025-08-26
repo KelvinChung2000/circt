@@ -301,6 +301,14 @@ LogicalResult LowerToCalyxPass::convertBlocksToGroups(ModuleOp moduleOp) {
         }
         // Control operations are not moved to groups - they stay in control
         continue;
+      } else if (isa<calyx::GroupDoneOp>(op)) {
+        // Encountered a GroupDoneOp - add it to current group and then split
+        currentGroup.push_back(&op);
+        if (!currentGroup.empty()) {
+          operationGroups.push_back(std::move(currentGroup));
+          currentGroup.clear();
+        }
+        continue;
       }
       // Add non-control operation to current group
       currentGroup.push_back(&op);

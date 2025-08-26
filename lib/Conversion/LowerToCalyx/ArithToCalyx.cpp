@@ -353,7 +353,6 @@ LogicalResult ArithCmpIToCalyxPattern::matchAndRewrite(
     ConversionPatternRewriter &rewriter) const {
 
   // Get operation location and operands
-  op.dump();
   auto loc = op.getLoc();
   Value lhs = adaptor.getLhs();
   Value rhs = adaptor.getRhs();
@@ -411,8 +410,7 @@ LogicalResult ArithCmpIToCalyxPattern::matchAndRewrite(
 
   // Replace the original arith operation result with the library operation
   // output
-  rewriter.replaceAllUsesWith(op.getResult(), outPort);
-  op.erase();
+  rewriter.replaceOp(op, outPort);
   return success();
 }
 
