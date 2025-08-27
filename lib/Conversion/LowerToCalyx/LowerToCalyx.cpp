@@ -175,6 +175,7 @@ void LowerToCalyxPass::runOnOperation() {
     return;
   }
 
+  moduleOp.dump();
   // Step 2: Apply SCF (Structured Control Flow) conversion patterns
   if (failed(applyControlFlowConversion(moduleOp))) {
     signalPassFailure();

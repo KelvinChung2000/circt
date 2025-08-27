@@ -67,108 +67,84 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
     mlir::scf::IfOp ifOp, mlir::scf::IfOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
 
-  // Get the condition and create register for this if operation
-  Value condition = ifOp.getCondition();
+  // Get condition
+  Value condition = adaptor.getCondition();
 
-  // Create register at component level - find the component and wires op
-  auto componentOp = ifOp->getParentOfType<calyx::ComponentOp>();
-  if (!componentOp) {
-    return rewriter.notifyMatchFailure(ifOp, "scf.if not within a component");
-  }
-
-  auto wiresOp = componentOp.getWiresOp();
-  if (!wiresOp) {
-    return rewriter.notifyMatchFailure(ifOp, "No WiresOp found in component");
-  }
-  // Set insertion point in the wires op body for register creation
-  rewriter.setInsertionPoint(wiresOp);
-
-  SmallVector<calyx::RegisterOp> ifResultsRegs;
-  for (size_t i = 0; i < ifOp.getResults().size(); ++i) {
-    std::string regName =
-        std::string("reg_") + getOpUniqueName(ifOp) + "_r_" + std::to_string(i);
-    ifResultsRegs.push_back(rewriter.create<calyx::RegisterOp>(
-        ifOp.getLoc(), regName, ifOp.getResult(i).getType()));
-  }
-
-  // Find the yield values in then and else regions
+  // Get regions
   auto &thenRegion = ifOp.getThenRegion();
   auto &elseRegion = ifOp.getElseRegion();
 
-  // code path some how have problem
-  // Check if both branches have no side effects - if so, use MuxLibOp
-  // optimization
-  // bool thenHasNoSideEffects = hasNoSideEffects(ifOp.getThenRegion());
-  // bool elseHasNoSideEffects = hasNoSideEffects(ifOp.getElseRegion());
+  // Get the component containing this operation
+  auto componentOp = ifOp->getParentOfType<calyx::ComponentOp>();
+  if (!componentOp) {
+    return ifOp.emitError("scf.if must be within a calyx.component");
+  }
 
-  // if (thenHasNoSideEffects && elseHasNoSideEffects) {
-  //   // Both branches are side-effect-free, use MuxLibOp instead
-  //   std::string muxName = "mux_" + getOpUniqueName(ifOp);
-  //   auto resultType = ifResult.getType();
+  // Find the wires block
+  auto wiresOp = componentOp.getWiresOp();
+  if (!wiresOp) {
+    return ifOp.emitError("calyx.component must have a wires block");
+  }
 
-  //   // First, move all operations from both regions out of the scf.if
-  //   IRMapping thenMapping, elseMapping;
+  // Track the result registers for scf.if
+  SmallVector<calyx::RegisterOp> ifResultsRegs;
 
-  //   // Clone operations from then region (excluding yield)
-  //   Value thenResult = nullptr;
-  //   if (!ifOp.getThenRegion().empty()) {
-  //     auto &thenBlock = ifOp.getThenRegion().front();
-  //     for (auto &op : llvm::make_early_inc_range(thenBlock)) {
-  //       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-  //         if (yieldOp.getNumOperands() > 0) {
-  //           thenResult = thenMapping.lookupOrDefault(yieldOp.getOperand(0));
-  //           if (!thenResult)
-  //             thenResult = yieldOp.getOperand(0);
-  //         }
-  //         continue; // Don't clone yield
-  //       }
-  //       // Clone the operation before the scf.if
-  //       auto *clonedOp = rewriter.clone(op, thenMapping);
-  //       (void)clonedOp; // Mark as used
-  //     }
-  //   }
+  // Create registers for each result
+  for (size_t i = 0; i < ifOp.getNumResults(); ++i) {
+    auto resultType = ifOp.getResult(i).getType();
 
-  //   // Clone operations from else region (excluding yield)
-  //   Value elseResult = nullptr;
-  //   if (!ifOp.getElseRegion().empty()) {
-  //     auto &elseBlock = ifOp.getElseRegion().front();
-  //     for (auto &op : llvm::make_early_inc_range(elseBlock)) {
-  //       if (auto yieldOp = dyn_cast<mlir::scf::YieldOp>(op)) {
-  //         if (yieldOp.getNumOperands() > 0) {
-  //           elseResult = elseMapping.lookupOrDefault(yieldOp.getOperand(0));
-  //           if (!elseResult)
-  //             elseResult = yieldOp.getOperand(0);
-  //         }
-  //         continue; // Don't clone yield
-  //       }
-  //       // Clone the operation before the scf.if
-  //       auto *clonedOp = rewriter.clone(op, elseMapping);
-  //       (void)clonedOp; // Mark as used
-  //     }
-  //   }
+    // Convert the result type to integer if needed
+    if (!resultType.isIntOrIndex()) {
+      return ifOp.emitError("scf.if result type must be integer or index");
+    }
 
-  //   // Create MuxLibOp at component level
-  //   rewriter.setInsertionPoint(wiresOp);
-  //   auto muxOp = rewriter.create<calyx::MuxLibOp>(
-  //       ifOp.getLoc(), muxName,
-  //       llvm::SmallVector<mlir::Type>{condition.getType(), resultType,
-  //                                     resultType, resultType});
+    unsigned bitWidth = 32; // Default for index type
+    if (auto intType = dyn_cast<IntegerType>(resultType)) {
+      bitWidth = intType.getWidth();
+    }
 
-  //   // Set up the mux connections in wires
-  //   rewriter.setInsertionPointToEnd(wiresOp.getBodyBlock());
+    // Create register name
+    std::string regName =
+        getOpUniqueName(ifOp) + "_result_" + std::to_string(i);
 
-  //   // Connect condition to mux.cond
-  //   rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getCond(),
-  //   condition);
+    // Set insertion point to before wires block
+    rewriter.setInsertionPoint(wiresOp);
 
-  //   // Connect then value to mux.tru
-  //   rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getTru(),
-  //   thenResult);
+    // Create the register
+    auto reg =
+        rewriter.create<calyx::RegisterOp>(ifOp.getLoc(), regName, bitWidth);
 
-  //   // Connect else value to mux.fal
-  //   rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getFal(),
-  //   elseResult); ifOp.dump();
-  //   // Replace the scf.if operation with the mux output
+    ifResultsRegs.push_back(reg);
+  }
+
+  // Set insertion point inside wires block
+  rewriter.setInsertionPointToEnd(wiresOp.getBodyBlock());
+
+  // If there are no results and both regions are simple, convert to a simple
+  // Calyx if
+  // if (ifOp.getNumResults() == 0 && isSingleAssignment(thenRegion) &&
+  //    isSingleAssignment(elseRegion)) {
+  //  // Convert to a simple mux operation
+  //  auto thenValue = getSingleAssignmentValue(thenRegion);
+  //  auto elseValue = getSingleAssignmentValue(elseRegion);
+  //  auto dest = getSingleAssignmentDest(thenRegion);
+
+  //  // Create mux name
+  //  std::string muxName = "if_mux_" + std::to_string(reinterpret_cast<size_t>(
+  //  ifOp.getOperation()));
+
+  //  // Create mux operation
+  //  auto muxOp = rewriter.create<calyx::MuxLibOp>(
+  //      ifOp.getLoc(), muxName, thenValue.getType());
+  //  rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getLeft(),
+  //  thenValue);
+  //  rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getRight(),
+  //  elseValue);
+  //  rewriter.create<calyx::AssignOp>(ifOp.getLoc(), muxOp.getSel(),
+  //  condition);
+  //  rewriter.create<calyx::AssignOp>(ifOp.getLoc(), dest, muxOp.getOut());
+
+  //   Replace the scf.if with the result of the mux
   //   rewriter.replaceOp(ifOp, muxOp.getOut());
   //   llvm::outs() << "Replaced scf.if with mux: " << muxName << "\n";
   //   return success();
@@ -176,8 +152,6 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
 
   // Create constant 1 for write enable using deduplication
   auto constantOne = getOrCreateConstant(componentOp.getOperation(), 1);
-
-  // We'll replace the scf.if op at the end, not here
 
   // Replace yield operations with register assignments and group_done
   // operations Then region
@@ -202,6 +176,8 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
           // Create group_done
           rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
         }
+        // Now safely erase the yield op since we've processed its operands
+        rewriter.eraseOp(yieldOp);
       }
     }
   }
@@ -214,6 +190,7 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
         auto operands = yieldOp.getOperands();
         if (operands.size() == 0) {
           rewriter.eraseOp(yieldOp);
+          continue; // Skip the rest of the processing for this yield
         }
 
         for (size_t i = 0; i < operands.size(); ++i) {
@@ -228,7 +205,8 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
               llvm::SmallVector<mlir::Type>{conditionType, conditionType});
           rewriter.setInsertionPoint(&op);
           rewriter.create<calyx::AssignOp>(
-              op.getLoc(), invertedCondition.getIn(), ifOp.getCondition());
+              ifOp.getLoc(), invertedCondition.getIn(), condition);
+          rewriter.setInsertionPoint(&op);
           // Create assignment: reg.in = elseYieldValue
           rewriter.create<calyx::AssignOp>(op.getLoc(), resultReg.getIn(),
                                            yieldValue,
@@ -240,6 +218,8 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
           // Create group_done
           rewriter.create<calyx::GroupDoneOp>(op.getLoc(), resultReg.getDone());
         }
+        // Erase the yield op after processing
+        rewriter.eraseOp(yieldOp);
       }
     }
   }
@@ -249,12 +229,6 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
     // Connect the calyx.if result to the register output
     ifOp.getResult(i).replaceAllUsesWith(ifResultsRegs[i].getOut());
   }
-
-  ifOp.walk([](mlir::Operation *op) {
-    if (isa<mlir::scf::YieldOp>(op)) {
-      op->erase();
-    }
-  });
 
   // Now replace the scf.if with calyx.if
   rewriter.setInsertionPoint(ifOp);
@@ -277,7 +251,7 @@ LogicalResult ScfIfToCalyxPattern::matchAndRewrite(
                                           sourceElseBlock.getOperations());
   }
 
-  ifOp.erase();
+  rewriter.eraseOp(ifOp);
   return success();
 }
 
@@ -426,7 +400,7 @@ LogicalResult ScfForToCalyxPattern::matchAndRewrite(
       return signals.front();
     // Chain AndLibOps pairwise: (((s0 & s1) & s2) & ...)
     Value accum = signals[0];
-    for (size_t i = 1; i < signals.size(); ++i) {
+    for (size_t i = 1; i < signals.size(); i++) {
       auto loc = forOp.getLoc();
       // Create AndLibOp at component level before wires.
       OpBuilder compBuilder(componentOp.getContext());

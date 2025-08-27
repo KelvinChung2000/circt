@@ -240,7 +240,7 @@ LogicalResult FuncFuncToCalyxPattern::matchAndRewrite(
     auto constantOp = getOrCreateConstant(componentOp, 1, 1);
     // Prepare builders: componentBuilder already set before wiresOp; create a
     // dedicated wiresBuilder pointing at end of wires body.
-    if (memrefUses.size() == 1) {
+    if (memrefUses[idx].size() == 1) {
       if (auto loadOp = dyn_cast<mlir::memref::LoadOp>(memrefUses[idx][0])) {
         loadLowering(rewriter, loadOp, memOp, loc, wiresOp, constantOp,
                      wiresBuilder, false);
